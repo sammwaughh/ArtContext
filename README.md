@@ -47,8 +47,10 @@ Results/                   # evaluation artefacts
 
 | Requirement | Why | macOS | Ubuntu |
 |-------------|-----|-------|--------|
+| **Python 3.11** | interpreter tested with the pipeline | `brew install python@3.11` or `pyenv install 3.11.9` | `sudo apt install python3.11` |
 | **Marker**  | PDF → Markdown | `pip install marker` | same |
 | **Graphviz** (optional) | pretty diagrams in notebooks | `brew install graphviz` | `sudo apt install graphviz` |
+| **Xcode CLT** (macOS) | build C-extensions if wheels are missing | `xcode-select --install` | – |
 
 ### 2.2 Create Python environment
 
@@ -62,7 +64,11 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 
 pip install --upgrade pip wheel
 pip install -r requirements.txt
-```
+
+The pinned versions in *requirements.txt* (`marker==2.1.5`,
+`requests==2.25.1`) avoid the dependency conflict we discovered while
+setting up the environment.  If you bump either package later, make sure
+they remain compatible.
 
 *GPU:*  
 – Apple Silicon users get Metal/MPS automatically.  
@@ -132,6 +138,7 @@ the `Label` columns are filled.
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
+| `ResolutionImpossible` about _marker_ / _requests_ | mixing newer `requests` with `marker 2.1.x` | keep `requests==2.25.1` **or** install `marker` with `--no-deps` |
 | `HTTP 429` from OpenAlex | Rate-limit | 03 script already sleeps and retries; just wait. |
 | `marker_single: command not found` | Marker not in PATH | `pip install marker` then reopen terminal. |
 | `torch.mps not available` | Old macOS / PyTorch | Upgrade to PyTorch ≥ 2.2 and macOS ≥ 12.3. |

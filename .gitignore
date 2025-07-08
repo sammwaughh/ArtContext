@@ -5,3 +5,6 @@
 .xlsx
 .pdf
 .jpeg
+
+# Environment
+.venv/

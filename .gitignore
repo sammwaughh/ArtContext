@@ -5,6 +5,7 @@
 .xlsx
 .pdf
 /Images
+/logs
 
 # Environment
 .venv/

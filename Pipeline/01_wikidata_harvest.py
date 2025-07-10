@@ -31,7 +31,7 @@ from tqdm import tqdm
 from urllib3.util import Retry
 
 # ─────────────────────────────────── constants ──────────────────────────────────
-LIMIT: int = 50_000
+LIMIT: int = 32_000
 INITIAL_CHUNK_SIZE: int = 400  # ↑ 60% - fewer pages, still fast
 MIN_CHUNK_SIZE: int = 100  # ↑ 100% - better fallback minimum
 CHUNK_GROW_BACK_FACTOR: float = 1.2
@@ -54,7 +54,7 @@ PAUSE_BETWEEN_PAGES: float = (
 MAX_ATTEMPTS: int = 6
 REQUEST_TIMEOUT: Tuple[int, int] = (10, 75)
 
-OUT_FILE: Path = Path("paintings.xlsx")
+OUT_FILE: Path = Path("Excel-Files/paintings.xlsx")
 
 # ─────────────────────────────────── logging ────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
@@ -159,12 +159,18 @@ def get_basic_records(offset: int, page_size: int, threshold: int):
     q = f"""
         SELECT ?painting ?paintingLabel ?creator ?creatorLabel
                ?inception ?wikipedia_url ?linkCount
+               ?materialLabel ?height ?width ?locationLabel ?collectionLabel
         WHERE {{
           ?painting wdt:P31 wd:Q3305213 ;
                     wikibase:sitelinks ?linkCount .
           FILTER(?linkCount >= {threshold})
           OPTIONAL {{ ?painting wdt:P170 ?creator }}
           OPTIONAL {{ ?painting wdt:P571 ?inception }}
+          OPTIONAL {{ ?painting wdt:P186 ?material }}
+          OPTIONAL {{ ?painting wdt:P2048 ?height }}
+          OPTIONAL {{ ?painting wdt:P2049 ?width }}
+          OPTIONAL {{ ?painting wdt:P276 ?location }}
+          OPTIONAL {{ ?painting wdt:P195 ?collection }}
           OPTIONAL {{
             ?paintingArticle schema:about ?painting ;
                              schema:inLanguage "en" ;
@@ -201,6 +207,12 @@ def get_basic_records(offset: int, page_size: int, threshold: int):
             "Inception": b.get("inception", {}).get("value", ""),
             "Wikipedia URL": b.get("wikipedia_url", {}).get("value", ""),
             "Link Count": int(b["linkCount"]["value"]),
+            # Add the missing fields
+            "Material": b.get("materialLabel", {}).get("value", ""),
+            "Height": b.get("height", {}).get("value", ""),
+            "Width": b.get("width", {}).get("value", ""),
+            "Location": b.get("locationLabel", {}).get("value", ""),
+            "Collection": b.get("collectionLabel", {}).get("value", ""),
         }
         pids.append(pid)
     return records, pids
@@ -308,21 +320,47 @@ df["File Name"] = (
 )
 df["Year"] = pd.to_numeric(df["Inception"].str[:4], errors="coerce")
 
+# Create combined dimensions field
+df["Dimensions"] = ""
+if "Height" in df.columns and "Width" in df.columns:
+    mask = (
+        df["Height"].notna()
+        & df["Width"].notna()
+        & (df["Height"] != "")
+        & (df["Width"] != "")
+    )
+    if mask.any():
+        df.loc[mask, "Dimensions"] = (
+            df.loc[mask, "Height"].astype(str)
+            + " × "
+            + df.loc[mask, "Width"].astype(str)
+            + " cm"
+        )
+
 desired_cols = [
     "Title",
     "File Name",
     "Creator",
+    "Year",
+    "Material",
+    "Dimensions",  # Combine height x width
+    "Location",
+    "Collection",
     "Movements",
     "Depicts",
-    "Year",
     "Wikipedia URL",
     "Link Count",
     "Painting ID",
     "Creator ID",
     "Movement IDs",
 ]
+
+# Ensure all desired columns exist with empty string defaults
 for col in desired_cols:
-    df.setdefault(col, "")
+    if col not in df.columns:
+        df[col] = ""
+
+# Select only the desired columns in the specified order
 df = df[desired_cols]
 df["Link Count"] = pd.to_numeric(df["Link Count"], errors="coerce")
 df.sort_values("Link Count", ascending=False, inplace=True)
@@ -330,8 +368,47 @@ df.sort_values("Link Count", ascending=False, inplace=True)
 with pd.ExcelWriter(OUT_FILE, engine="openpyxl") as w:
     df.to_excel(w, index=False, sheet_name="Paintings")
     ws = w.sheets["Paintings"]
+
+    # Enhanced column formatting
     for i, col in enumerate(df.columns, 1):
-        width = min(max(df[col].astype(str).str.len().max(), len(col)) + 2, 40)
-        ws.column_dimensions[get_column_letter(i)].width = width
+        col_letter = get_column_letter(i)
+
+        # Calculate optimal width based on content
+        max_length = max(
+            df[col].astype(str).str.len().max() if not df[col].empty else 0, len(col)
+        )
+        # Set width with reasonable bounds
+        width = min(max(max_length + 2, 8), 50)
+        ws.column_dimensions[col_letter].width = width
+
+        # Special formatting for specific columns
+        if col == "Year":
+            for cell in ws[col_letter][1:]:  # Skip header
+                if cell.value and str(cell.value).isdigit():
+                    cell.number_format = "0"
+        elif col == "Link Count":
+            for cell in ws[col_letter][1:]:  # Skip header
+                if cell.value:
+                    cell.number_format = "#,##0"
+        elif col in ["Wikipedia URL", "Painting ID", "Creator ID"]:
+            for cell in ws[col_letter][1:]:  # Skip header
+                if cell.value:
+                    cell.style = "Hyperlink"
+
+    # Style the header row
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill(
+        start_color="366092", end_color="366092", fill_type="solid"
+    )
+
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Freeze the header row
+    ws.freeze_panes = "A2"
 
 print("Done – saved", OUT_FILE)

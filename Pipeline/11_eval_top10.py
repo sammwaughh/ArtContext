@@ -11,41 +11,43 @@ Columns
 File_Name | Title | Creator | SentenceRank | Sentence | Score | Label
 """
 from __future__ import annotations
+
 import pathlib
-from typing import Dict, Tuple, List
+
+# ── new imports ─────────────────────────────────────────
+import re
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from transformers import CLIPProcessor, CLIPModel
-from peft import PeftModel
-from tqdm import tqdm
 from openpyxl import load_workbook
+from peft import PeftModel
 from PIL import Image
+from tqdm import tqdm
+from transformers import CLIPModel, CLIPProcessor
 
-# ── new imports ─────────────────────────────────────────
-import re
-try:                                 # OpenPyXL ≥3.1
+try:  # OpenPyXL ≥3.1
     from openpyxl.utils.cell import ILLEGAL_CHARACTERS_RE
-except ImportError:                  # older versions
+except ImportError:  # older versions
     # Excel refuses control chars 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F
     ILLEGAL_CHARACTERS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]")
 # ────────────────────────────────────────────────────────
 
 
 # ─────────────── paths ───────────────
-ROOT          = pathlib.Path(__file__).resolve().parent.parent
-CACHE_DIR     = ROOT / "Dataset" / "cache_clip_embeddings"
-PAINTERS_XLS  = ROOT / "Dataset" / "painters.xlsx"
-LABELS_XLS    = ROOT / "Dataset" / "paintings_with_labels.xlsx"
-FINETUNE_XLS  = ROOT / "FineTune" / "fine_tune_dataset.xlsx"
-IMAGES_DIR    = ROOT / "Dataset" / "Images"
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CACHE_DIR = ROOT / "Dataset" / "cache_clip_embeddings"
+PAINTERS_XLS = ROOT / "Dataset" / "painters.xlsx"
+LABELS_XLS = ROOT / "Dataset" / "paintings_with_labels.xlsx"
+FINETUNE_XLS = ROOT / "FineTune" / "fine_tune_dataset.xlsx"
+IMAGES_DIR = ROOT / "Dataset" / "Images"
 
-LORA_DIR      = ROOT / "Results" / "clip_finetuned_lora_best"
+LORA_DIR = ROOT / "Results" / "clip_finetuned_lora_best"
 
-OUT_VANILLA   = ROOT / "Results" / "vanilla_clip.xlsx"
-OUT_MINT      = ROOT / "Results" / "mint_clip.xlsx"
+OUT_VANILLA = ROOT / "Results" / "vanilla_clip.xlsx"
+OUT_MINT = ROOT / "Results" / "mint_clip.xlsx"
 
 TOP_K = 10
 # ──────────────────────────────────────
@@ -69,8 +71,8 @@ def topk_for_image(
     inputs = proc(images=img, return_tensors="pt").to(device)
     img_vec = F.normalize(model.get_image_features(**inputs).squeeze(0), dim=-1)
     txt_vec = F.normalize(txt_embs.to(device), dim=-1)
-    sims    = (txt_vec @ img_vec).cpu()
-    top     = torch.topk(sims, k=k, largest=True, sorted=True)
+    sims = (txt_vec @ img_vec).cpu()
+    top = torch.topk(sims, k=k, largest=True, sorted=True)
     return top.indices.numpy(), top.values.numpy()
 
 
@@ -93,13 +95,16 @@ if not caches:
     raise RuntimeError("No cache files matched any query string.")
 
 labels_df = pd.read_excel(LABELS_XLS)
-ft_df     = pd.read_excel(FINETUNE_XLS)
+ft_df = pd.read_excel(FINETUNE_XLS)
 title_col = "Title" if "Title" in ft_df.columns else "Name"
 
 merged = ft_df.merge(
     labels_df[["File Name", "Creator"]],
-    on="File Name", how="left", validate="many_to_one"
+    on="File Name",
+    how="left",
+    validate="many_to_one",
 ).rename(columns={"File Name": "File_Name"})
+
 
 def match_qs(creator):
     if not isinstance(creator, str):
@@ -110,6 +115,7 @@ def match_qs(creator):
             return qs
     return None
 
+
 merged["cache_key"] = merged["Creator"].apply(match_qs)
 paintings = merged.dropna(subset=["cache_key"])
 if paintings.empty:
@@ -118,10 +124,11 @@ if paintings.empty:
 
 # ─── 2. models ───
 device = (
-    torch.device("mps") if torch.backends.mps.is_available()
+    torch.device("mps")
+    if torch.backends.mps.is_available()
     else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 )
-MODEL_ID  = "openai/clip-vit-base-patch32"
+MODEL_ID = "openai/clip-vit-base-patch32"
 processor = CLIPProcessor.from_pretrained(MODEL_ID, use_fast=True)
 
 print("⚙️  Loading Vanilla-CLIP …")
@@ -136,6 +143,7 @@ mint = PeftModel.from_pretrained(base, LORA_DIR).to(device).eval()
 def clean(value):
     """Strip characters Excel refuses."""
     return ILLEGAL_CHARACTERS_RE.sub("", value) if isinstance(value, str) else value
+
 
 def harvest(model: CLIPModel, out_path: pathlib.Path) -> None:
     rows: List[dict] = []
@@ -163,15 +171,17 @@ def harvest(model: CLIPModel, out_path: pathlib.Path) -> None:
         idx, sims = topk_for_image(model, processor, img_p, txt_embs, TOP_K, device)
 
         for rank, (i, score) in enumerate(zip(idx, sims), start=1):
-            rows.append({
-                "File_Name":    fn,
-                "Title":        clean(title),
-                "Creator":      clean(creator),
-                "SentenceRank": rank,
-                "Sentence":     clean(sentences[i]),
-                "Score":        float(score),
-                "Label":        "",
-            })
+            rows.append(
+                {
+                    "File_Name": fn,
+                    "Title": clean(title),
+                    "Creator": clean(creator),
+                    "SentenceRank": rank,
+                    "Sentence": clean(sentences[i]),
+                    "Score": float(score),
+                    "Label": "",
+                }
+            )
         processed += 1
 
     df = pd.DataFrame(rows)
@@ -188,7 +198,10 @@ def harvest(model: CLIPModel, out_path: pathlib.Path) -> None:
         ws.column_dimensions[col[0].column_letter].width = width
     wb.save(out_path)
 
-    print(f"✅  {out_path.name}: processed {processed} paintings, skipped {skipped} (image missing).")
+    print(
+        f"✅  {out_path.name}: processed {processed} paintings, "
+        f"skipped {skipped} (image missing)."
+    )
 
 
 # ─── 4. run ───

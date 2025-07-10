@@ -203,7 +203,7 @@ data = [
     {"Artist": "Balthus", "Query String": "balthus"},
     {"Artist": "Francesco Guardi", "Query String": "guardi"},
     {"Artist": "Canaletto", "Query String": "canaletto"},
-    {"Artist": "Giovanni Battista Tiepolo", "Query String": "tiepolo"}
+    {"Artist": "Giovanni Battista Tiepolo", "Query String": "tiepolo"},
 ]
 
 # Create a DataFrame from the list.
@@ -227,7 +227,7 @@ for col in ws.columns:
             cell_length = len(str(cell.value))
             if cell_length > max_length:
                 max_length = cell_length
-        except:
+        except Exception:  # noqa: BLE001
             pass
     adjusted_width = max_length + 2  # add a little extra padding
     ws.column_dimensions[col_letter].width = adjusted_width

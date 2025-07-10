@@ -1,82 +1,106 @@
-import requests
-import pandas as pd
-from openpyxl.utils import get_column_letter
-import time
+import argparse
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pandas as pd
+import requests
+from openpyxl.utils import get_column_letter
+from requests.adapters import HTTPAdapter
+from tqdm import tqdm
+from urllib3.util import Retry
 
 # ---------------- Setup Logging ----------------
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
 
 # ---------------- User Parameters ----------------
-total_limit = 100000         # Total number of paintings to retrieve
-chunk_size = 1000          # Records to retrieve per chunk
-sitelinks_threshold = 1    # Minimum number of sitelinks (notability proxy)
+def parse_args():
+    p = argparse.ArgumentParser(description="Harvest painting metadata from Wikidata")
+    p.add_argument("--limit", type=int, default=50_000, help="max rows")
+    p.add_argument("--chunk", type=int, default=1_000, help="rows per SPARQL page")
+    p.add_argument("--sitelinks", type=int, default=1, help="min sitelinks")
+    p.add_argument("--out", default="paintings.xlsx", help="output file")
+    p.add_argument(
+        "--workers", type=int, default=8, help="threads for aggregated queries"
+    )
+    return p.parse_args()
 
-max_retries = 5            # Maximum number of retries for a query
-base_sleep = 5             # Base sleep time (seconds) for retries
-subchunk_size = 200        # Maximum number of painting IDs per aggregated query
 
-# ---------------- Function to query Wikidata with retries (exponential backoff) ----------------
+args = parse_args()
+
+total_limit = args.limit  # Total number of paintings to retrieve
+chunk_size = args.chunk  # Records to retrieve per chunk
+sitelinks_threshold = args.sitelinks  # Minimum number of sitelinks (notability proxy)
+
+# ---------------- constants ----------------
+subchunk_size = 200  # ≤ 200 keeps the URL length safe
+
+
+# ---------------- session with retry ----------------
+def make_session():
+    retries = Retry(
+        total=5,
+        backoff_factor=1.5,
+        status_forcelist=(429, 500, 502, 503),
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    s = requests.Session()
+    s.headers.update(
+        {
+            "User-Agent": "ArtContext/0.1 (contact: your@email)",
+            "Accept": "application/sparql-results+json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+    )
+    s.mount("https://", adapter)
+    return s
+
+
+SESSION = make_session()
+
+
+# ---------------- Function to query Wikidata with retries ----------------
 def query_wikidata(query):
     url = "https://query.wikidata.org/sparql"
-    headers = {
-        "User-Agent": "MyPythonSPARQLClient/0.1 (xlct43@durham.ac.uk)",
-        "Accept": "application/sparql-results+json",
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    attempt = 0
-    sleep_seconds = base_sleep
-    while attempt < max_retries:
-        try:
-            logging.info(f"Sending query to Wikidata (attempt {attempt+1}/{max_retries})...")
-            # Use POST so the query is sent in the body, not in the URL.
-            response = requests.post(url, headers=headers, data={'query': query})
-            if response.status_code == 429:
-                logging.warning("Rate limit encountered (HTTP 429). Sleeping for %s seconds...", sleep_seconds)
-                time.sleep(sleep_seconds)
-                attempt += 1
-                sleep_seconds *= 2
-                continue
-            if response.status_code == 500:
-                logging.warning("Internal Server Error (HTTP 500) encountered. Sleeping for %s seconds and retrying...", sleep_seconds)
-                time.sleep(sleep_seconds)
-                attempt += 1
-                sleep_seconds *= 2
-                continue
-            if response.status_code == 414:
-                logging.error("URI Too Long (HTTP 414) encountered. Your query is too large.")
-                raise Exception("Query string is too long.")
-            response.raise_for_status()
-            logging.info("Query successful.")
-            return response.json()
-        except requests.exceptions.HTTPError as e:
-            logging.error("HTTP error encountered: %s", e)
-            attempt += 1
-            time.sleep(sleep_seconds)
-            sleep_seconds *= 2
-    raise Exception("Failed to retrieve data from Wikidata after several attempts.")
+    try:
+        logging.info("Sending query to Wikidata...")
+        # Use POST so the query is sent in the body, not in the URL.
+        response = SESSION.post(url, data={"query": query})
+        response.raise_for_status()
+        logging.info("Query successful.")
+        return response.json()
+    except requests.exceptions.HTTPError as e:
+        logging.error("HTTP error encountered: %s", e)
+        raise
+
 
 # ---------------- Function: Get Basic Records ----------------
-def get_basic_records(offset, chunk_size, threshold):
+def get_basic_records(offset: int, chunk_size: int, threshold: int):
     basic_query = f"""
-    SELECT ?painting ?paintingLabel ?creator ?creatorLabel ?inception ?wikipedia_url ?linkCount WHERE {{
-      ?painting wdt:P31 wd:Q3305213.
-      ?painting wikibase:sitelinks ?linkCount.
-      FILTER(?linkCount >= {threshold}).
-      OPTIONAL {{ ?painting wdt:P170 ?creator. }}
-      OPTIONAL {{ ?painting wdt:P571 ?inception. }}
-      OPTIONAL {{
-        ?paintingArticle schema:about ?painting ;
-                         schema:inLanguage "en" ;
-                         schema:isPartOf <https://en.wikipedia.org/> .
-        BIND(?paintingArticle AS ?wikipedia_url)
-      }}
-      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }}
-    }}
-    ORDER BY DESC(?linkCount)
-    LIMIT {chunk_size}
-    OFFSET {offset}
-    """
+        SELECT ?painting ?paintingLabel ?creator ?creatorLabel
+               ?inception ?wikipedia_url ?linkCount
+        WHERE {{
+          ?painting wdt:P31 wd:Q3305213.
+          ?painting wikibase:sitelinks ?linkCount.
+          FILTER(?linkCount >= {threshold}).
+          OPTIONAL {{ ?painting wdt:P170 ?creator. }}
+          OPTIONAL {{ ?painting wdt:P571 ?inception. }}
+          OPTIONAL {{
+            ?paintingArticle schema:about ?painting ;
+                             schema:inLanguage "en" ;
+                             schema:isPartOf <https://en.wikipedia.org/> .
+            BIND(?paintingArticle AS ?wikipedia_url)
+          }}
+          SERVICE wikibase:label {{
+            bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en".
+          }}
+        }}
+        ORDER BY DESC(?linkCount)
+        LIMIT {chunk_size} OFFSET {offset}
+        """
     data = query_wikidata(basic_query)
     bindings = data.get("results", {}).get("bindings", [])
     basic_records = {}
@@ -91,49 +115,61 @@ def get_basic_records(offset, chunk_size, threshold):
                 "Creator": item.get("creatorLabel", {}).get("value", ""),
                 "Inception": item.get("inception", {}).get("value", ""),
                 "Wikipedia URL": item.get("wikipedia_url", {}).get("value", ""),
-                "Link Count": item.get("linkCount", {}).get("value", "")
+                "Link Count": item.get("linkCount", {}).get("value", ""),
             }
             painting_ids.append(pid)
     return basic_records, painting_ids
 
+
 # ---------------- Function: Get Aggregated Fields in Subchunks ----------------
-def get_aggregated_fields(painting_ids):
+def get_aggregated_fields(painting_ids, workers):
     agg_records = {}
-    # Split painting_ids into subchunks to avoid an overly long VALUES clause.
-    for i in range(0, len(painting_ids), subchunk_size):
-        sub_ids = painting_ids[i:i+subchunk_size]
-        values_clause = "VALUES ?painting { " + " ".join(f"<{pid}>" for pid in sub_ids) + " }"
+
+    def one_subquery(sub_ids):
         agg_query = f"""
-        SELECT ?painting 
-               (GROUP_CONCAT(DISTINCT ?depictsLabel; separator=", ") AS ?depictsAggregated)
-               (GROUP_CONCAT(DISTINCT ?movementLabel; separator=", ") AS ?movements)
-               (GROUP_CONCAT(DISTINCT ?movement; separator=", ") AS ?movementIDs)
-        WHERE {{
-          {values_clause}
-          OPTIONAL {{
-              ?painting wdt:P180 ?depicts.
-              ?depicts rdfs:label ?depictsLabel.
-              FILTER(LANG(?depictsLabel) = "en")
-          }}
-          OPTIONAL {{
-              ?painting wdt:P135 ?movement.
-              ?movement rdfs:label ?movementLabel.
-              FILTER(LANG(?movementLabel) = "en")
-          }}
-        }}
-        GROUP BY ?painting
-        """
+             SELECT ?painting
+                   (GROUP_CONCAT(DISTINCT ?depictsLabel;
+                                 separator=", ") AS ?depictsAggregated)
+                   (GROUP_CONCAT(DISTINCT ?movementLabel;
+                                 separator=", ") AS ?movements)
+                   (GROUP_CONCAT(DISTINCT ?movement; separator=", ")
+                                 AS ?movementIDs)
+            WHERE {{
+              VALUES ?painting {{ {" ".join(sub_ids)} }}
+              OPTIONAL {{
+                  ?painting wdt:P180 ?depicts.
+                  ?depicts rdfs:label ?depictsLabel.
+                  FILTER(LANG(?depictsLabel) = "en")
+              }}
+              OPTIONAL {{
+                  ?painting wdt:P135 ?movement.
+                  ?movement rdfs:label ?movementLabel.
+                  FILTER(LANG(?movementLabel) = "en")
+              }}
+            }}
+            """
         sub_agg_data = query_wikidata(agg_query)
         sub_bindings = sub_agg_data.get("results", {}).get("bindings", [])
+        sub_agg_records = {}
         for item in sub_bindings:
             pid = item.get("painting", {}).get("value", "")
             if pid:
-                agg_records[pid] = {
+                sub_agg_records[pid] = {
                     "Depicts": item.get("depictsAggregated", {}).get("value", ""),
                     "Movements": item.get("movements", {}).get("value", ""),
-                    "Movement IDs": item.get("movementIDs", {}).get("value", "")
+                    "Movement IDs": item.get("movementIDs", {}).get("value", ""),
                 }
+        return sub_agg_records
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(one_subquery, painting_ids[i : i + subchunk_size])
+            for i in range(0, len(painting_ids), subchunk_size)
+        ]
+        for f in as_completed(futures):
+            agg_records.update(f.result())
     return agg_records
+
 
 # ---------------- Function: Merge Basic and Aggregated Records ----------------
 def merge_records(basic_records, agg_records):
@@ -147,6 +183,7 @@ def merge_records(basic_records, agg_records):
             basic["Movement IDs"] = ""
         merged.append(basic)
     return merged
+
 
 # ---------------- Function: Process Record Fields ----------------
 def process_record_fields(records):
@@ -169,6 +206,7 @@ def process_record_fields(records):
             rec["Year"] = None
     return records
 
+
 # ---------------- Main Loop ----------------
 logging.info(f"Starting retrieval of metadata for up to {total_limit} paintings...")
 logging.info(f"Chunk size: {chunk_size}, Sitelinks threshold: >= {sitelinks_threshold}")
@@ -176,42 +214,58 @@ logging.info(f"Chunk size: {chunk_size}, Sitelinks threshold: >= {sitelinks_thre
 all_results = []
 offset = 0
 
+pbar = tqdm(total=args.limit, unit=" rows")
 try:
-    while len(all_results) < total_limit:
+    while len(all_results) < args.limit:
         logging.info(f"Querying basic records with OFFSET {offset} ...")
-        basic_records, painting_ids = get_basic_records(offset, chunk_size, sitelinks_threshold)
+        basic_records, painting_ids = get_basic_records(
+            offset, chunk_size, sitelinks_threshold
+        )
         if not basic_records:
             logging.info("No more basic records returned; ending pagination.")
             break
         logging.info(f"Retrieved {len(basic_records)} unique basic records.")
-    
-        agg_records = get_aggregated_fields(painting_ids)
+
+        agg_records = get_aggregated_fields(painting_ids, args.workers)
         merged_records = merge_records(basic_records, agg_records)
-    
+
         # Append new records, avoiding duplicates.
         existing_ids = {r["Painting ID"] for r in all_results}
+        new_records = []
         for record in merged_records:
             if record["Painting ID"] not in existing_ids:
-                all_results.append(record)
-    
+                new_records.append(record)
+        all_results.extend(new_records)
+
         offset += chunk_size
         if len(all_results) >= total_limit:
             logging.info("Reached the total desired number of records.")
             break
         time.sleep(1)  # Throttle between chunks
+        pbar.update(len(new_records))
 except KeyboardInterrupt:
     logging.info("Process interrupted by user.")
+finally:
+    pbar.close()
 
 logging.info(f"Collected {len(all_results)} rows from the queries.")
 
 all_results = process_record_fields(all_results)
 
 # ---------------- Create DataFrame and Reorder Columns ----------------
-# Final desired order:
-# Title, File Name, Creator, Movements, Depicts, Year, Wikipedia URL, Link Count, Painting ID, Creator ID, Movement IDs
+# Final column order (kept short for E501)
 final_order = [
-    "Title", "File Name", "Creator", "Movements", "Depicts", "Year",
-    "Wikipedia URL", "Link Count", "Painting ID", "Creator ID", "Movement IDs"
+    "Title",
+    "File Name",
+    "Creator",
+    "Movements",
+    "Depicts",
+    "Year",
+    "Wikipedia URL",
+    "Link Count",
+    "Painting ID",
+    "Creator ID",
+    "Movement IDs",
 ]
 
 df = pd.DataFrame(all_results)
@@ -220,18 +274,18 @@ for col in final_order:
         df[col] = ""
 df = df[final_order]
 
-df["Link Count"] = pd.to_numeric(df["Link Count"], errors='coerce')
+df["Link Count"] = pd.to_numeric(df["Link Count"], errors="coerce")
 df.sort_values(by="Link Count", ascending=False, inplace=True)
 
 logging.info("DataFrame created. Number of unique records: %s", len(df))
 
 # ---------------- Write DataFrame to Excel ----------------
-output_filename = "paintings2.xlsx"
+output_filename = args.out
 logging.info(f"Writing data to Excel file '{output_filename}'...")
 
-with pd.ExcelWriter(output_filename, engine='openpyxl') as writer:
-    df.to_excel(writer, index=False, sheet_name='Paintings')
-    worksheet = writer.sheets['Paintings']
+with pd.ExcelWriter(output_filename, engine="openpyxl") as writer:
+    df.to_excel(writer, index=False, sheet_name="Paintings")
+    worksheet = writer.sheets["Paintings"]
     # Adjust column widths based on maximum content length, capped at 60.
     for i, column in enumerate(df.columns, 1):
         max_length = max(df[column].astype(str).map(len).max(), len(column))

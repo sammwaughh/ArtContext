@@ -1,7 +1,9 @@
-import argparse
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import islice
+from pathlib import Path
 
 import pandas as pd
 import requests
@@ -10,33 +12,37 @@ from requests.adapters import HTTPAdapter
 from tqdm import tqdm
 from urllib3.util import Retry
 
-# ---------------- Setup Logging ----------------
+# ---------------- Constants ----------------
+LIMIT = 50_000  # max paintings to fetch
+CHUNK_SIZE = 1_000  # rows per SPARQL page
+SITELINKS_THRESHOLD = 1  # min sitelinks (notability proxy)
+WORKERS = 8  # threads for aggregated queries
+SUBCHUNK_SIZE = 200  # ids per aggregated SPARQL query           <─ NEW
+OUT_FILE = Path("paintings.xlsx")
+
+# ---------------- Logging ----------------
+LOG_DIR = "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    filename=os.path.join(LOG_DIR, "wikidata_harvest.log"),
+    filemode="w",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
+print("Harvesting painting metadata…")  # brief console notice
 
-# ---------------- User Parameters ----------------
-def parse_args():
-    p = argparse.ArgumentParser(description="Harvest painting metadata from Wikidata")
-    p.add_argument("--limit", type=int, default=50_000, help="max rows")
-    p.add_argument("--chunk", type=int, default=1_000, help="rows per SPARQL page")
-    p.add_argument("--sitelinks", type=int, default=1, help="min sitelinks")
-    p.add_argument("--out", default="paintings.xlsx", help="output file")
-    p.add_argument(
-        "--workers", type=int, default=8, help="threads for aggregated queries"
-    )
-    return p.parse_args()
+total_limit = LIMIT
+chunk_size = CHUNK_SIZE
+sitelinks_threshold = SITELINKS_THRESHOLD
 
 
-args = parse_args()
-
-total_limit = args.limit  # Total number of paintings to retrieve
-chunk_size = args.chunk  # Records to retrieve per chunk
-sitelinks_threshold = args.sitelinks  # Minimum number of sitelinks (notability proxy)
-
-# ---------------- constants ----------------
-subchunk_size = 200  # ≤ 200 keeps the URL length safe
+# ---------------- Helpers ----------------
+def chunked(iterable, size):
+    """Yield successive *size*-element tuples from *iterable*."""
+    it = iter(iterable)
+    while chunk := tuple(islice(it, size)):
+        yield chunk
 
 
 # ---------------- session with retry ----------------
@@ -115,7 +121,7 @@ def get_basic_records(offset: int, chunk_size: int, threshold: int):
                 "Creator": item.get("creatorLabel", {}).get("value", ""),
                 "Inception": item.get("inception", {}).get("value", ""),
                 "Wikipedia URL": item.get("wikipedia_url", {}).get("value", ""),
-                "Link Count": item.get("linkCount", {}).get("value", ""),
+                "Link Count": int(item.get("linkCount", {}).get("value", 0)),
             }
             painting_ids.append(pid)
     return basic_records, painting_ids
@@ -124,6 +130,7 @@ def get_basic_records(offset: int, chunk_size: int, threshold: int):
 # ---------------- Function: Get Aggregated Fields in Subchunks ----------------
 def get_aggregated_fields(painting_ids, workers):
     agg_records = {}
+    subchunk_size = SUBCHUNK_SIZE  # NEW
 
     def one_subquery(sub_ids):
         agg_query = f"""
@@ -163,8 +170,8 @@ def get_aggregated_fields(painting_ids, workers):
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [
-            pool.submit(one_subquery, painting_ids[i : i + subchunk_size])
-            for i in range(0, len(painting_ids), subchunk_size)
+            pool.submit(one_subquery, chunk)
+            for chunk in chunked(painting_ids, subchunk_size)
         ]
         for f in as_completed(futures):
             agg_records.update(f.result())
@@ -185,38 +192,16 @@ def merge_records(basic_records, agg_records):
     return merged
 
 
-# ---------------- Function: Process Record Fields ----------------
-def process_record_fields(records):
-    for rec in records:
-        # Compute File Name: extract Q-ID from Painting ID URL and append _0.png.
-        pid = rec.get("Painting ID", "")
-        if pid:
-            qid = pid.rstrip("/").split("/")[-1]
-            rec["File Name"] = f"{qid}_0.png"
-        else:
-            rec["File Name"] = ""
-        # Process Inception into Year as an integer.
-        inception = rec.get("Inception", "")
-        if inception and len(inception) >= 4:
-            try:
-                rec["Year"] = int(inception[:4])
-            except ValueError:
-                rec["Year"] = None
-        else:
-            rec["Year"] = None
-    return records
-
-
 # ---------------- Main Loop ----------------
 logging.info(f"Starting retrieval of metadata for up to {total_limit} paintings...")
 logging.info(f"Chunk size: {chunk_size}, Sitelinks threshold: >= {sitelinks_threshold}")
 
-all_results = []
+all_results: list[dict] = []
 offset = 0
 
-pbar = tqdm(total=args.limit, unit=" rows")
+pbar = tqdm(total=LIMIT, unit=" rows")  # bar length = fixed limit
 try:
-    while len(all_results) < args.limit:
+    while len(all_results) < LIMIT:  # args.* removed
         logging.info(f"Querying basic records with OFFSET {offset} ...")
         basic_records, painting_ids = get_basic_records(
             offset, chunk_size, sitelinks_threshold
@@ -226,7 +211,7 @@ try:
             break
         logging.info(f"Retrieved {len(basic_records)} unique basic records.")
 
-        agg_records = get_aggregated_fields(painting_ids, args.workers)
+        agg_records = get_aggregated_fields(painting_ids, WORKERS)
         merged_records = merge_records(basic_records, agg_records)
 
         # Append new records, avoiding duplicates.
@@ -250,8 +235,19 @@ finally:
 
 logging.info(f"Collected {len(all_results)} rows from the queries.")
 
-all_results = process_record_fields(all_results)
+#
+# Vectorised post-processing in one DataFrame.
+#
 
+df = pd.DataFrame(all_results)
+
+# File Name  (extract Q-ID at tail of URL)
+df["File Name"] = df["Painting ID"].str.extract(r"([^/]+)$")[0].fillna("") + "_0.png"
+
+# Year from first four chars of Inception
+df["Year"] = pd.to_numeric(df["Inception"].str.slice(0, 4), errors="coerce")
+
+# Re-order once the new columns exist
 # ---------------- Create DataFrame and Reorder Columns ----------------
 # Final column order (kept short for E501)
 final_order = [
@@ -268,7 +264,6 @@ final_order = [
     "Movement IDs",
 ]
 
-df = pd.DataFrame(all_results)
 for col in final_order:
     if col not in df.columns:
         df[col] = ""
@@ -280,7 +275,7 @@ df.sort_values(by="Link Count", ascending=False, inplace=True)
 logging.info("DataFrame created. Number of unique records: %s", len(df))
 
 # ---------------- Write DataFrame to Excel ----------------
-output_filename = args.out
+output_filename = OUT_FILE
 logging.info(f"Writing data to Excel file '{output_filename}'...")
 
 with pd.ExcelWriter(output_filename, engine="openpyxl") as writer:
@@ -294,4 +289,5 @@ with pd.ExcelWriter(output_filename, engine="openpyxl") as writer:
             adjusted_width = 40
         worksheet.column_dimensions[get_column_letter(i)].width = adjusted_width
 
-logging.info(f"Excel file saved to '{output_filename}'.")
+logging.info("Excel file saved to '%s'.", output_filename)
+print("Done.")  # brief console notice

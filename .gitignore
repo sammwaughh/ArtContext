@@ -2,7 +2,7 @@
 .DS_Store
 
 # Files
-.xlsx
+Excel-Files/
 .pdf
 /Images
 /Pipeline/logs

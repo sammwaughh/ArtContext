@@ -5,7 +5,7 @@
 .xlsx
 .pdf
 /Images
-/logs
+/Pipeline/logs
 
 # Environment
 .venv/

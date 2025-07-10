@@ -9,3 +9,6 @@
 
 # Environment
 .venv/
+
+# Prompting
+.github/prompts

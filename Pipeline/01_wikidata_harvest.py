@@ -14,6 +14,7 @@ Major changes versus previous revision
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -31,20 +32,24 @@ from urllib3.util import Retry
 
 # ─────────────────────────────────── constants ──────────────────────────────────
 LIMIT: int = 50_000
-INITIAL_CHUNK_SIZE: int = 250
-MIN_CHUNK_SIZE: int = 50
+INITIAL_CHUNK_SIZE: int = 400  # ↑ 60% - fewer pages, still fast
+MIN_CHUNK_SIZE: int = 100  # ↑ 100% - better fallback minimum
 CHUNK_GROW_BACK_FACTOR: float = 1.2
 
 SITELINKS_THRESHOLD: int = 1
-SUBCHUNK_SIZE: int = 100
-WORKERS: int = 1  # ≤ 5 per WDQS policy
+SUBCHUNK_SIZE: int = 200  # ↑ 100% - fewer aggregation requests
+WORKERS: int = 3  # ≤ 5 per WDQS policy  # ↑ 200% - optimal parallel sweet spot
 
 # ───────────────────────────── contact constants ──────────────────────────────
 CONTACT_EMAIL: str = "samjmwaugh@gmail.com"
 ORG_URL: str = "https://github.com/sammwaughh/ArtContext"
 
-PAUSE_BETWEEN_HTTP: float = 1.0  # polite delay after *every* HTTP
-PAUSE_BETWEEN_PAGES: float = 5.0  # extra pause between main pages
+PAUSE_BETWEEN_HTTP: float = (
+    0.3  # polite delay after *every* HTTP  # ↓ 70% - still respectful
+)
+PAUSE_BETWEEN_PAGES: float = (
+    1.5  # extra pause between main pages   # ↓ 70% - reasonable gap
+)
 
 MAX_ATTEMPTS: int = 6
 REQUEST_TIMEOUT: Tuple[int, int] = (10, 75)
@@ -108,17 +113,30 @@ def query_wd(query: str) -> dict:
             r = SESSION.post(url, data={"query": query}, timeout=REQUEST_TIMEOUT)
             if r.status_code == 429:  # rate‑limited
                 retry_for = int(r.headers.get("Retry-After", "60"))
-                logging.warning("429 Too Many Requests – waiting %s s", retry_for)
+                logging.warning("429 Too Many Requests – waiting %s s", retry_for)
                 time.sleep(retry_for)
                 continue
             r.raise_for_status()
-            return r.json()
+
+            # Safe JSON parsing with fallback
+            try:
+                return r.json()
+            except json.JSONDecodeError as json_err:
+                logging.error("JSON decode error: %s", json_err)
+                logging.error("Response text (first 200 chars): %s", r.text[:200])
+                # Treat JSON errors like network errors - retry with backoff
+                if attempt < MAX_ATTEMPTS:
+                    wait = 2**attempt
+                    logging.warning("JSON parsing failed – retry in %s s", wait)
+                    time.sleep(wait)
+                    continue
+                raise
 
         except requests.exceptions.HTTPError as exc:
             code = getattr(exc.response, "status_code", None)
             if code in TRANSIENT and attempt < MAX_ATTEMPTS:
                 wait = 2**attempt
-                logging.warning("%s from WDQS – retry in %s s", code, wait)
+                logging.warning("%s from WDQS – retry in %s s", code, wait)
                 time.sleep(wait)
                 continue
             logging.error("Fatal HTTP error: %s", exc)
@@ -127,7 +145,7 @@ def query_wd(query: str) -> dict:
         except requests.exceptions.RequestException as exc:
             if attempt < MAX_ATTEMPTS:
                 wait = 2**attempt
-                logging.warning("Network error: %s – retry in %s s", exc, wait)
+                logging.warning("Network error: %s – retry in %s s", exc, wait)
                 time.sleep(wait)
                 continue
             raise
@@ -159,8 +177,12 @@ def get_basic_records(offset: int, page_size: int, threshold: int):
         """
     try:
         data = query_wd(q)
-    except (requests.exceptions.ReadTimeout, requests.exceptions.HTTPError) as exc:
-        # halve page size on time‑out or 504
+    except (
+        requests.exceptions.ReadTimeout,
+        requests.exceptions.HTTPError,
+        json.JSONDecodeError,
+    ) as exc:
+        # halve page size on time‑out, 504, or JSON parsing errors
         if page_size > MIN_CHUNK_SIZE:
             new_size = max(page_size // 2, MIN_CHUNK_SIZE)
             logging.warning("Query failed (%s) – retrying with size %d", exc, new_size)

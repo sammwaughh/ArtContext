@@ -38,6 +38,11 @@ CHUNK_GROW_BACK_FACTOR: float = 1.2
 SITELINKS_THRESHOLD: int = 1
 SUBCHUNK_SIZE: int = 100
 WORKERS: int = 1  # ≤ 5 per WDQS policy
+
+# ───────────────────────────── contact constants ──────────────────────────────
+CONTACT_EMAIL: str = "samjmwaugh@gmail.com"
+ORG_URL: str = "https://github.com/sammwaughh/ArtContext"
+
 PAUSE_BETWEEN_HTTP: float = 1.0  # polite delay after *every* HTTP
 PAUSE_BETWEEN_PAGES: float = 5.0  # extra pause between main pages
 
@@ -79,8 +84,7 @@ def make_session() -> requests.Session:
         {
             # WDQS maintainers want a *descriptive* UA with contact info
             "User-Agent": (
-                "ArtContextHarvester/0.2 "
-                "(https://github.com/your‑org/ArtContext; mailto:your@email)"
+                f"ArtContextHarvester/0.2 ({ORG_URL}; mailto:{CONTACT_EMAIL})"
             ),
             "Accept": "application/sparql-results+json",
             "Content-Type": "application/x-www-form-urlencoded",

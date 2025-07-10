@@ -14,10 +14,10 @@ from urllib3.util import Retry
 
 # ---------------- Constants ----------------
 LIMIT = 50_000  # max paintings to fetch
-CHUNK_SIZE = 1_000  # rows per SPARQL page
+CHUNK_SIZE = 500  # rows per SPARQL page (smaller page sorts faster)
 SITELINKS_THRESHOLD = 1  # min sitelinks (notability proxy)
-WORKERS = 8  # threads for aggregated queries
-SUBCHUNK_SIZE = 200  # ids per aggregated SPARQL query           <─ NEW
+WORKERS = 2  # threads for aggregated queries (reduced from 8)
+SUBCHUNK_SIZE = 200  # ids per aggregated SPARQL query
 OUT_FILE = Path("paintings.xlsx")
 
 # ---------------- Logging ----------------
@@ -69,18 +69,36 @@ SESSION = make_session()
 
 
 # ---------------- Function to query Wikidata with retries ----------------
-def query_wikidata(query):
+MAX_ATTEMPTS = 6  # unchanged
+REQUEST_TIMEOUT = (10, 75)  # connect=10 s, read=75 s  ← NEW
+
+
+def query_wikidata(query: str) -> dict:
+    """POST *query* to the Wikidata endpoint with client-side retries."""
     url = "https://query.wikidata.org/sparql"
-    try:
-        logging.info("Sending query to Wikidata...")
-        # Use POST so the query is sent in the body, not in the URL.
-        response = SESSION.post(url, data={"query": query})
-        response.raise_for_status()
-        logging.info("Query successful.")
-        return response.json()
-    except requests.exceptions.HTTPError as e:
-        logging.error("HTTP error encountered: %s", e)
-        raise
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            logging.info("Sending query (attempt %d/%d)…", attempt, MAX_ATTEMPTS)
+            resp = SESSION.post(url, data={"query": query}, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.HTTPError as exc:
+            if resp.status_code == 504 and attempt < MAX_ATTEMPTS:
+                wait = 2**attempt  # 2,4,8,16,32 s
+                logging.warning("504 Gateway Timeout, retrying in %s s…", wait)
+                time.sleep(wait)
+                continue
+            logging.error("HTTP error: %s", exc)
+            raise
+        except requests.exceptions.RequestException as exc:
+            # Covers connection resets, DNS issues, etc.
+            if attempt < MAX_ATTEMPTS:
+                wait = 2**attempt
+                logging.warning("Network error: %s ‒ retry in %s s…", exc, wait)
+                time.sleep(wait)
+                continue
+            logging.error("Gave up after %d attempts.", attempt)
+            raise
 
 
 # ---------------- Function: Get Basic Records ----------------
@@ -133,8 +151,10 @@ def get_aggregated_fields(painting_ids, workers):
     subchunk_size = SUBCHUNK_SIZE  # NEW
 
     def one_subquery(sub_ids):
+        # Build the VALUES clause once.
+        values_clause = " ".join(f"<{pid}>" for pid in sub_ids)
         agg_query = f"""
-             SELECT ?painting
+              SELECT ?painting
                    (GROUP_CONCAT(DISTINCT ?depictsLabel;
                                  separator=", ") AS ?depictsAggregated)
                    (GROUP_CONCAT(DISTINCT ?movementLabel;
@@ -142,7 +162,7 @@ def get_aggregated_fields(painting_ids, workers):
                    (GROUP_CONCAT(DISTINCT ?movement; separator=", ")
                                  AS ?movementIDs)
             WHERE {{
-              VALUES ?painting {{ {" ".join(sub_ids)} }}
+              VALUES ?painting {{ {values_clause} }}
               OPTIONAL {{
                   ?painting wdt:P180 ?depicts.
                   ?depicts rdfs:label ?depictsLabel.
@@ -154,10 +174,28 @@ def get_aggregated_fields(painting_ids, workers):
                   FILTER(LANG(?movementLabel) = "en")
               }}
             }}
+            GROUP BY ?painting
             """
-        sub_agg_data = query_wikidata(agg_query)
-        sub_bindings = sub_agg_data.get("results", {}).get("bindings", [])
         sub_agg_records = {}
+        try:
+            sub_agg_data = query_wikidata(agg_query)
+        except requests.exceptions.HTTPError as exc:
+            if exc.response.status_code == 400:
+                # Too-large or otherwise invalid query: split or skip.
+                if len(sub_ids) > 1:
+                    mid = len(sub_ids) // 2
+                    left = one_subquery(sub_ids[:mid])
+                    right = one_subquery(sub_ids[mid:])
+                    return {**left, **right}
+                # Single-ID query still fails → give up on that record.
+                logging.warning(
+                    "Skipping painting %s – Wikidata returned 400 for "
+                    "single-ID aggregated query.",
+                    sub_ids[0],
+                )
+                return {}
+            raise
+        sub_bindings = sub_agg_data.get("results", {}).get("bindings", [])
         for item in sub_bindings:
             pid = item.get("painting", {}).get("value", "")
             if pid:
@@ -169,10 +207,11 @@ def get_aggregated_fields(painting_ids, workers):
         return sub_agg_records
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [
-            pool.submit(one_subquery, chunk)
-            for chunk in chunked(painting_ids, subchunk_size)
-        ]
+        futures = []
+        for chunk in chunked(painting_ids, subchunk_size):
+            futures.append(pool.submit(one_subquery, chunk))
+            time.sleep(0.1)  # Throttle submission of new queries
+
         for f in as_completed(futures):
             agg_records.update(f.result())
     return agg_records

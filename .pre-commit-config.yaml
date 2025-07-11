@@ -10,6 +10,7 @@ repos:
       - id: isort
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.12.2
+    rev: v0.4.7          # pin a version
     hooks:
       - id: ruff
+        args: [--fix]     # ← enables auto-applied fixes

@@ -10,7 +10,8 @@ requests==2.25.1       # satisfies marker 2.1.5
 tqdm>=4.66
 openpyxl>=3.1
 psutil>=5.9
-pypdfium2>=4.20            # quick PDF sanity check
+httpx[http2]>=0.27            # async downloads + HTTP/2
+pypdfium2>=4.20               # quick PDF sanity check
 striprtf>=0.0.22           # RTF → plain text (rare use-case)
 Pillow>=10.3
 nltk>=3.8

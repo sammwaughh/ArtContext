@@ -1,546 +1,507 @@
-import concurrent.futures
+#!/usr/bin/env python3
+"""
+Stage 3 of the pipeline – harvest OpenAlex literature for a set of painters,
+store the metadata in Excel and download the relevant PDFs.
+
+CLI
+---
+python 03_openalex_download.py                 # all painters
+python 03_openalex_download.py -r 150          # first 150
+python 03_openalex_download.py -r 350:420      # rows 350 – 420 (1-based, inclusive)
+
+Style
+-----
+• PEP 526 type annotations
+• SCREAMING_SNAKE_CASE constants
+• Modern Python 3.9+ syntax
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
 import json
 import logging
 import os
 import re
 import threading
 import time
+from logging.handlers import TimedRotatingFileHandler
+from pathlib import Path
+from typing import Dict, List, Tuple
 
+import httpx
 import pandas as pd
 import psutil
 import requests
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from requests.adapters import HTTPAdapter
+from tqdm import tqdm
+from urllib3.util.retry import Retry
 
-# Set your email here
-my_email = "xlct43@durham.ac.uk"
+# ──────────────────────────── configuration ───────────────────────────────────
+
+CONTACT_EMAIL: str = "xlct43@durham.ac.uk"
+PAINTERS_XLSX: Path = Path("painters.xlsx")
+EXCEL_DIR: Path = Path("ExcelFiles")
+PDF_DIR: Path = Path("PDFs")
+
+LOG_DIRS: Tuple[Path, ...] = (
+    Path("fetch-logs"),
+    Path("excel-logs"),
+    Path("download-logs"),
+    Path("cpu-logs"),
+)
+
+TOPIC_IDS: str = (
+    "T14092|T14191|T12372|T14469|T12680|T14366|T13922|T12444|"
+    "T13133|T12179|T13342|T12632|T14002|T14322"
+)
+
+DEFAULT_PER_PAGE: int = 200  # OpenAlex page size
+PDF_CHUNK_SIZE: int = 8_192  # bytes
+CPU_SAMPLE_SEC: int = 1
+MAX_RETRIES: int = 3
+BACKOFF_FACTOR: float = 0.3
+SESSION_TIMEOUT_SEC: int = 20
+MAX_WORKERS_FACTOR: int = 2  # ≈ workers = CPUs × factor
+MIN_WORKERS: int = 4
+
+START_ROW: int = 1  # default CLI range start (1-based)
+END_ROW: int | None = None  # default CLI range end   (inclusive)
+DEFAULT_SLEEP_SEC: float = 1.0  # politeness delay between API calls
+
+# ──────────────────────────── helpers & utils ─────────────────────────────────
 
 
-# --- Utility: Setup logger ---
-def setup_logger(
-    name, log_file, level=logging.INFO, fmt="%(asctime)s - %(levelname)s - %(message)s"
-):
-    """Set up a logger that writes to log_file."""
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-    # Remove any existing handlers (if re‑using the same name)
-    if logger.hasHandlers():
-        logger.handlers.clear()
-    fh = logging.FileHandler(log_file)
-    formatter = logging.Formatter(fmt)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-    return logger
+def _make_session() -> requests.Session:
+    """Return a shared, retry-enabled HTTP session."""
+    retry: Retry = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=BACKOFF_FACTOR,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"],
+        raise_on_status=False,
+    )
+    sess: requests.Session = requests.Session()
+    adapter: HTTPAdapter = HTTPAdapter(max_retries=retry)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    sess.headers.update({"User-Agent": f"ArtContext/0.1 (mailto:{CONTACT_EMAIL})"})
+    return sess
 
 
-# Global logger variables (will be re‑assigned for each painter)
-fetch_logger = None
-excel_logger = None
-download_logger = None
-cpu_logger = None
-
-# Global list to store download time data (reset for each painter)
-download_time_data = []
+SESSION: requests.Session = _make_session()
 
 
-# --- Utility functions ---
-def convert_to_str(value):
-    """Convert dictionaries or lists to a JSON string; otherwise, return the value."""
+def _setup_logger() -> logging.Logger:
+    """One rotating root logger (midnight UTC)."""
+    log_dir: Path = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    handler = TimedRotatingFileHandler(
+        log_dir / "openalex.log", when="midnight", utc=True, backupCount=7
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    root = logging.getLogger("openalex")
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    return root
+
+
+LOGGER: logging.Logger = _setup_logger()
+
+
+def _safe_json_parse(value: str | Dict | List) -> Dict | List | None:
+    """`json.loads` that survives invalid input."""
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
-    return value
-
-
-def safe_json_parse(cell_value):
-    """
-    Return *cell_value* if it is already a dict / list.
-    Otherwise try ``json.loads`` and return the result.
-    """
-    if isinstance(cell_value, (dict, list)):
-        return cell_value
+        return value
     try:
-        return json.loads(cell_value)
-    except Exception:
+        return json.loads(value)
+    except Exception:  # noqa: BLE001
         return None
 
 
-def sanitize_filename(name):
-    """Remove characters not allowed in file names."""
+def _sanitize_filename(name: str) -> str:
+    """Remove characters that are invalid on most OS filesystems."""
     return re.sub(r'[\\/*?:"<>|]', "", name).strip()
 
 
-# --- Core functions ---
-def fetch_works(painter_name):
-    """
-    Fetch all works from OpenAlex that meet the following criteria:
-      - language is English (language:en)
-      - the work is open access (is_oa:true)
-      - the work has one of the specified topic IDs in its topics list
-      - the work's searchable metadata mentions the painter_name
-    """
-    base_url = "https://api.openalex.org/works"
-    topics_ids = (
-        "T14092|T14191|T12372|T14469|T12680|T14366|T13922|T12444|"
-        "T13133|T12179|T13342|T12632|T14002|T14322"
-    )
-    filter_str = f"language:en,is_oa:true,topics.id:{topics_ids}"
-    cursor = "*"
-    per_page = 200
-    works = []
-    page_count = 0
-    headers = {"User-Agent": f"MyPythonClient (mailto:{my_email})"}
+# ──────────────────────────── OpenAlex access ─────────────────────────────────
 
-    fetch_logger.info(f"Starting query for works mentioning '{painter_name}'...")
+
+def fetch_works(
+    painter: str,
+    per_page: int,
+    sleep_sec: float,
+) -> List[Dict]:
+    """
+    Retrieve every OpenAlex work that is
+    English, open-access, within TOPIC_IDS and mentions *painter*.
+    """
+    base_url: str = "https://api.openalex.org/works"
+    query_filter: str = f"language:en,is_oa:true,topics.id:{TOPIC_IDS}"
+    cursor: str | None = "*"
+    works: List[Dict] = []
+    page: int = 0
+
+    LOGGER.info("Query start – painter=%s", painter)
+    pbar = tqdm(desc=f"{painter} pages", unit="page")
+
     while cursor:
-        page_count += 1
-        fetch_logger.info(f"Querying page {page_count}...")
-        params = {
-            "filter": filter_str,
-            "search": painter_name,
+        page += 1
+        pbar.update(1)
+        params: Dict[str, str | int | float] = {
+            "filter": query_filter,
+            "search": painter,
             "per_page": per_page,
             "cursor": cursor,
-            "mailto": my_email,
+            "mailto": CONTACT_EMAIL,
         }
         while True:
-            response = requests.get(base_url, params=params, headers=headers)
-            if response.status_code == 429:
-                fetch_logger.warning("Rate limit exceeded. Sleeping for 60 seconds...")
-                time.sleep(60)
-            else:
+            resp = SESSION.get(base_url, params=params, timeout=SESSION_TIMEOUT_SEC)
+            if resp.status_code != 429:
                 break
-        if response.status_code != 200:
-            fetch_logger.error(f"Error: Received status code {response.status_code}")
-            fetch_logger.error(f"Response content: {response.text}")
+            retry_after = int(resp.headers.get("Retry-After", "60"))
+            LOGGER.warning("429 – sleeping %d s", retry_after)
+            time.sleep(retry_after)
+
+        if resp.status_code != 200:  # give up – log & abort
+            LOGGER.error("HTTP %s – %s", resp.status_code, resp.text[:200])
             break
-        data = response.json()
-        results = data.get("results", [])
-        works.extend(results)
-        fetch_logger.info(f"Page {page_count}: Retrieved {len(results)} works.")
+
+        data: Dict = resp.json()
+        page_results: List[Dict] = data.get("results", [])
+        works.extend(page_results)
         cursor = data.get("meta", {}).get("next_cursor")
-        if not cursor:
-            fetch_logger.info("No further pages found.")
-            break
-        time.sleep(1)
-    fetch_logger.info(
-        "Query complete. Total pages: %d. Total works: %d",
-        page_count,
-        len(works),
-    )
-    return works
+
+        LOGGER.info("%s page %d – %d works", painter, page, len(page_results))
+        time.sleep(sleep_sec)
+
+    pbar.close()
+    LOGGER.info("%s finished – pages=%d  works=%d", painter, page, len(works))
+    # Early relevance filter
+    return [w for w in works if w.get("relevance_score", 0) > 1]
 
 
-def get_candidate_links(row):
-    """
-    Given a row (from the Filtered DataFrame), extract candidate download links.
-    """
-    candidates = []
-    best_oa = safe_json_parse(row.get("best_oa_location"))
-    if best_oa and isinstance(best_oa, dict):
-        if best_oa.get("pdf_url"):
-            candidates.append(best_oa["pdf_url"])
-        elif best_oa.get("landing_page_url"):
-            candidates.append(best_oa["landing_page_url"])
-    oa = safe_json_parse(row.get("open_access"))
-    if oa and isinstance(oa, dict) and oa.get("oa_url"):
-        candidates.append(oa["oa_url"])
-    primary = safe_json_parse(row.get("primary_location"))
-    if primary and isinstance(primary, dict):
-        if primary.get("pdf_url"):
-            candidates.append(primary["pdf_url"])
-        elif primary.get("landing_page_url"):
-            candidates.append(primary["landing_page_url"])
-    locs = safe_json_parse(row.get("locations"))
-    if locs and isinstance(locs, list):
-        for loc in locs:
-            if isinstance(loc, dict):
-                if loc.get("pdf_url"):
-                    candidates.append(loc["pdf_url"])
-                elif loc.get("landing_page_url"):
-                    candidates.append(loc["landing_page_url"])
-    return list(dict.fromkeys(candidates))
+# ───────────────────────── Excel creation ─────────────────────────────────────
+
+MAIN_COLS: Tuple[str, ...] = (
+    "title",
+    "relevance_score",
+    "id",
+    "doi",
+    "primary_location",
+    "type",
+    "open_access",
+    "locations",
+    "best_oa_location",
+)
 
 
-def get_best_and_backup_links(row):
-    """
-    Return (best_link, backup_link) for one *row* of **df_filtered**.
+def _get_candidate_links(row: pd.Series) -> List[str]:
+    """Collect all distinct OA/PDF URLs from the various location blobs."""
+    candidates: List[str] = []
+    best_oa = _safe_json_parse(row["best_oa_location"])
+    if isinstance(best_oa, dict):
+        candidates += [best_oa.get("pdf_url"), best_oa.get("landing_page_url")]
 
-    Strategy:
-      • first candidate that contains “.pdf”  → best_link
-      • next candidate (if any)              → backup_link
-    """
-    candidates = get_candidate_links(row)
-    best_link = ""
-    backup_link = ""
-    for link in candidates:
+    oa = _safe_json_parse(row["open_access"])
+    if isinstance(oa, dict):
+        candidates.append(oa.get("oa_url"))
+
+    primary = _safe_json_parse(row["primary_location"])
+    if isinstance(primary, dict):
+        candidates += [primary.get("pdf_url"), primary.get("landing_page_url")]
+
+    for loc in _safe_json_parse(row["locations"]) or []:
+        if isinstance(loc, dict):
+            candidates += [loc.get("pdf_url"), loc.get("landing_page_url")]
+
+    return [c for c in dict.fromkeys(candidates) if c]  # dedupe & drop None
+
+
+def _best_and_backup(row: pd.Series) -> Tuple[str, str]:
+    """Return “best” PDF link plus a backup (may be empty strings)."""
+    for_best: List[str] = _get_candidate_links(row)
+    best: str = ""
+    backup: str = ""
+    for link in for_best:
         if ".pdf" in link.lower():
-            best_link = link
+            best = link
             break
-    if not best_link and candidates:
-        best_link = candidates[0]
-    for link in candidates:
-        if link != best_link:
-            backup_link = link
+    if not best and for_best:
+        best = for_best[0]
+    for link in for_best:
+        if link != best:
+            backup = link
             break
-    return best_link, backup_link
+    return best or "", backup or ""
 
 
-def create_excel_file(painter_name, works):
-    """
-    Build three DataFrames from *works* then write them to one workbook.
+def create_excel(painter: str, works: List[Dict]) -> Path:
+    """Write three sheets (Main, Filtered, Downloadable) and return the file path."""
+    df_main: pd.DataFrame = (
+        pd.DataFrame(works) if works else pd.DataFrame(columns=MAIN_COLS)
+    )
+    df_filtered: pd.DataFrame = df_main[MAIN_COLS].copy()
 
-    Sheets
-    ------
-    • Main          – every column in the JSON returned by OpenAlex
-    • Filtered      – subset of useful columns
-    • Downloadable  – Title, Relevance Score, Best/Back-up link, OpenAlexID, Type
-    """
-    # If no works were fetched, create an empty DataFrame with the expected columns.
-    if works:
-        df_main = pd.DataFrame(works)
-    else:
-        expected_columns = [
-            "title",
-            "relevance_score",
-            "id",
-            "doi",
-            "primary_location",
-            "type",
-            "open_access",
-            "locations",
-            "best_oa_location",
-        ]
-        df_main = pd.DataFrame(columns=expected_columns)
-
-    filtered_columns = [
-        "title",
-        "relevance_score",
-        "id",
-        "doi",
-        "primary_location",
-        "type",
-        "open_access",
-        "locations",
-        "best_oa_location",
-    ]
-    df_filtered = df_main[filtered_columns].copy()
-
-    downloadable_data = []
+    rows_downloadable: List[Dict[str, str | float]] = []
     for _, row in df_filtered.iterrows():
-        title = row.get("title", "")
-        relevance = row.get("relevance_score", 0)
-        openalex_id = row.get("id", "")
-        work_type = row.get("type", "")
-        best_link, backup_link = get_best_and_backup_links(row)
-        downloadable_data.append(
+        best, backup = _best_and_backup(row)
+        rows_downloadable.append(
             {
-                "Title": title,
-                "Relevance Score": relevance,
-                "Best Link": best_link,
-                "Back Up Link": backup_link,
-                "OpenAlexID": openalex_id,
-                "Type": work_type,
+                "Title": row.get("title", ""),
+                "Relevance Score": row.get("relevance_score", 0.0),
+                "Best Link": best,
+                "Backup Link": backup,
+                "OpenAlex ID": row.get("id", ""),
+                "Type": row.get("type", ""),
             }
         )
-    df_downloadable = pd.DataFrame(downloadable_data)
+    df_download: pd.DataFrame = pd.DataFrame(rows_downloadable)
 
-    filename = os.path.join("ExcelFiles", f"{painter_name.lower()}_works.xlsx")
-    with pd.ExcelWriter(filename, engine="openpyxl") as writer:
+    dest: Path = EXCEL_DIR / f"{painter.lower()}_works.xlsx"
+    with pd.ExcelWriter(dest, engine="openpyxl") as writer:
         df_main.to_excel(writer, index=False, sheet_name="Main")
         df_filtered.to_excel(writer, index=False, sheet_name="Filtered")
-        df_downloadable.to_excel(writer, index=False, sheet_name="Downloadable")
+        df_download.to_excel(writer, index=False, sheet_name="Downloadable")
 
-    wb = load_workbook(filename)
-    ws_main = wb["Main"]
-    for col in ws_main.columns:
-        col_letter = get_column_letter(col[0].column)
-        max_length = max(
-            (len(str(cell.value)) for cell in col if cell.value is not None), default=0
-        )
-        ws_main.column_dimensions[col_letter].width = max_length + 2
-    for sheet in ["Filtered", "Downloadable"]:
-        ws = wb[sheet]
-        for col in ws.columns:
-            col_letter = get_column_letter(col[0].column)
-            ws.column_dimensions[col_letter].width = 35
-    wb.save(filename)
-    excel_logger.info(
-        "Excel file %s created with sheets: Main, Filtered, Downloadable.",
-        filename,
-    )
-    return filename
-
-
-def download_pdf(
-    index, title, best_link, backup_link, openalex_id, work_type, directory
-):
-    """
-    Download one PDF.
-
-    Order of attempts
-    -----------------
-    1. *best_link*
-    2. *backup_link* (if the first fails)
-
-    On success the file is saved as
-    ``{index}-{sanitized_title}.pdf`` in *directory* and timing is logged.
-    """
-    sanitized_title = sanitize_filename(title)
-    pdf_filename = f"{index}-{sanitized_title}.pdf"
-    filepath = os.path.join(directory, pdf_filename)
-    start_time = time.perf_counter()
-    for link in [best_link, backup_link]:
-        if link and isinstance(link, str) and link.strip():
-            try:
-                download_logger.info(f"Row {index}: Attempting download from: {link}")
-                response = requests.get(link, stream=True, timeout=20)
-                if response.status_code == 200:
-                    with open(filepath, "wb") as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    end_time = time.perf_counter()
-                    elapsed_sec = round(end_time - start_time, 3)
-                    download_logger.info(
-                        "Row %d: downloaded %s in %.3f s",
-                        index,
-                        filepath,
-                        elapsed_sec,
-                    )
-                    download_time_data.append(
-                        {
-                            "PDF Name": pdf_filename,
-                            "Time": elapsed_sec,
-                            "Type": work_type,
-                        }
-                    )
-                    return True
-                else:
-                    download_logger.warning(
-                        "Row %d: status %s on link %s",
-                        index,
-                        response.status_code,
-                        link,
-                    )
-            except Exception as e:
-                download_logger.error(
-                    f"Row {index}: Error downloading from {link}: {e}"
-                )
-    download_logger.error(
-        f"Row {index}: All download attempts failed (ID: {openalex_id})."
-    )
-    return False
-
-
-def monitor_cpu(stop_event, interval=1):
-    """
-    Monitors and logs CPU usage every `interval` seconds until stop_event is set.
-    """
-    cpu_usages = []
-    while not stop_event.is_set():
-        usage = psutil.cpu_percent(interval=interval)
-        cpu_usages.append(usage)
-        cpu_logger.info(f"Current CPU usage: {usage}%")
-    avg = sum(cpu_usages) / len(cpu_usages) if cpu_usages else 0
-    cpu_logger.info(f"Average CPU usage during download: {avg:.2f}%")
-
-
-def append_download_time_sheet(excel_file, painter_name, total_runtime):
-    """
-    Appends a new sheet "Download Times" to the existing Excel file.
-    The sheet contains a table (PDF Name, Time, Type) sorted by Time descending,
-    with a final row showing the total program runtime.
-    """
-    if download_time_data:
-        df_time = pd.DataFrame(download_time_data, columns=["PDF Name", "Time", "Type"])
-        df_time = df_time.sort_values(by="Time", ascending=False).reset_index(drop=True)
-        total_row = pd.DataFrame(
-            {
-                "PDF Name": ["Total Program Runtime"],
-                "Time": [f"{total_runtime:.3f} seconds"],
-                "Type": [""],
-            }
-        )
-        df_time = pd.concat([df_time, total_row], ignore_index=True)
-
-        wb = load_workbook(excel_file)
-        if "Download Times" in wb.sheetnames:
-            ws_del = wb["Download Times"]
-            wb.remove(ws_del)
-        ws = wb.create_sheet(title="Download Times")
-
-        headers = list(df_time.columns)
-        ws.append(headers)
-        for row in df_time.itertuples(index=False, name=None):
-            ws.append(list(row))
-
-        for col in ws.columns:
-            col_letter = get_column_letter(col[0].column)
-            max_length = max(
-                (len(str(cell.value)) for cell in col if cell.value is not None),
-                default=0,
+    # autosize columns (rough)
+    wb = load_workbook(dest)
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        for column in ws.columns:
+            width: int = max(len(str(cell.value)) for cell in column if cell.value) + 2
+            ws.column_dimensions[get_column_letter(column[0].column)].width = min(
+                width, 50
             )
-            ws.column_dimensions[col_letter].width = max_length + 2
-        wb.save(excel_file)
-        download_logger.info(
-            f"Download time data appended as a new sheet in '{excel_file}'."
-        )
-        print(f"Download time data appended as a new sheet in '{excel_file}'.")
-    else:
-        download_logger.info("No download time data to append.")
+    wb.save(dest)
+    LOGGER.info("%s workbook saved (%d rows)", painter, len(df_main))
+    return dest
 
 
-def download_all_pdfs(excel_file, painter_name, max_workers):
+# ───────────────────────── PDF download (async) ────────────────────────────
+
+
+async def _grab_pdf(
+    idx: int,
+    title: str,
+    best: str,
+    backup: str,
+    sem: asyncio.Semaphore,
+    out_dir: Path,
+) -> Tuple[str, float] | None:
+    """Async download with automatic Retry-After handling."""
+    filename = f"{idx}-{_sanitize_filename(title)}.pdf"
+    path = out_dir / filename
+    start = time.perf_counter()
+
+    async with sem:
+        async with httpx.AsyncClient(timeout=SESSION_TIMEOUT_SEC) as client:
+            for url in (best, backup):
+                if not url:
+                    continue
+                try:
+                    r = await client.get(url, follow_redirects=True)
+                    if r.status_code == 429:
+                        retry_after = int(r.headers.get("Retry-After", "60"))
+                        await asyncio.sleep(retry_after)
+                        continue
+                    if r.status_code != 200:
+                        LOGGER.warning(
+                            "Row %d – HTTP %s on %s", idx, r.status_code, url
+                        )
+                        continue
+                    path.write_bytes(r.content)
+                    return filename, round(time.perf_counter() - start, 3)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.error("Row %d – %s on %s", idx, exc, url)
+    return None
+
+
+def _monitor_cpu(stop_evt: threading.Event, clog: logging.Logger) -> None:
+    """Log instantaneous and average CPU usage until *stop_evt* is set."""
+    samples: List[float] = []
+    while not stop_evt.wait(CPU_SAMPLE_SEC):
+        usage: float = psutil.cpu_percent()
+        samples.append(usage)
+        clog.info("CPU %.1f%%", usage)
+    if samples:
+        clog.info("Average CPU %.2f%%", sum(samples) / len(samples))
+
+
+async def download_pdfs(
+    excel_file: Path,
+    painter: str,
+    max_workers: int,
+    dlog: logging.Logger,
+    clog: logging.Logger,
+) -> List[Tuple[str, float]]:
     """
-    Read sheet “Downloadable”, create the painter’s PDF dir and download PDFs
-    in parallel (relevance score > 1).  CPU usage is monitored in a thread.
-    A “Download Times” sheet is appended after completion.
+    Parallel PDF download (relevance_score > 1).
+    Returns list of (pdf_name, seconds).
     """
-    df = pd.read_excel(excel_file, sheet_name="Downloadable", engine="openpyxl")
-    # Remove duplicates based on the Title column
+    df: pd.DataFrame = pd.read_excel(
+        excel_file, sheet_name="Downloadable", engine="openpyxl"
+    )
     df = df.drop_duplicates(subset=["Title"], keep="first")
 
-    pdf_dir = os.path.join("PDFs", painter_name.lower())
-    os.makedirs(pdf_dir, exist_ok=True)
+    out_dir: Path = PDF_DIR / painter.lower()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    stop_event = threading.Event()
-    cpu_thread = threading.Thread(target=monitor_cpu, args=(stop_event,), daemon=True)
-    cpu_thread.start()
+    stop_evt = threading.Event()
+    threading.Thread(target=_monitor_cpu, args=(stop_evt, clog), daemon=True).start()
 
-    start_time = time.perf_counter()
-    download_logger.info("Starting parallel PDF download tasks...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = []
-        for i, row in enumerate(df.itertuples(index=False)):
-            relevance = row[1]
-            if relevance <= 1:
-                download_logger.info(
-                    f"Row {i}: Skipping due to low relevance score ({relevance})."
-                )
-                continue
-            title = row[0]
-            best_link = row[2]
-            backup_link = row[3]
-            openalex_id = row[4]
-            work_type = row[5]
-            download_logger.info(f"Submitting download task for row {i}: {title}")
-            futures.append(
-                executor.submit(
-                    download_pdf,
-                    i,
-                    title,
-                    best_link,
-                    backup_link,
-                    openalex_id,
-                    work_type,
-                    pdf_dir,
-                )
-            )
-        download_logger.info("Waiting for all download tasks to complete...")
-        concurrent.futures.wait(futures)
-    stop_event.set()
-    cpu_thread.join()
-    end_time = time.perf_counter()
-    total_runtime = round(end_time - start_time, 3)
-    download_logger.info(f"All downloads attempted in {total_runtime:.2f} seconds.")
-    print(f"All downloads attempted in {total_runtime:.2f} seconds.")
+    sem = asyncio.Semaphore(max_workers)
+    tasks = []
+    for idx, row in enumerate(df.itertuples(index=False), start=1):
+        tasks.append(
+            _grab_pdf(idx, row[0], row[2], row[3], sem, out_dir)
+        )  # Title / links
+    results: List[Tuple[str, float]] = []
+    for coro in tqdm(
+        asyncio.as_completed(tasks), total=len(tasks), desc=f"{painter} PDFs"
+    ):
+        res = await coro
+        if res:
+            results.append(res)
 
-    # Append the download time sheet to the Excel file.
-    append_download_time_sheet(excel_file, painter_name, total_runtime)
+    stop_evt.set()
+
+    failed = {row[0] for row in df.itertuples(index=False)} - {r[0] for r in results}
+    if failed:
+        (out_dir / "failed_downloads.txt").write_text("\n".join(sorted(failed)))
+    return results
 
 
-# --- Painter processing ---
-def process_painter(painter, max_workers):
-    """
-    End-to-end routine for a single *painter*:
-      1. configure loggers
-      2. fetch works (OpenAlex)
-      3. write Excel workbook
-      4. download PDFs
-      5. log total runtime
-    """
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    global fetch_logger, excel_logger, download_logger, cpu_logger, download_time_data
-    # Set up individual log files (stored in respective directories)
-    fetch_logger = setup_logger(
-        "fetch", os.path.join("fetch-logs", f"{painter}-{timestamp}.log")
-    )
-    excel_logger = setup_logger(
-        "excel", os.path.join("excel-logs", f"{painter}-{timestamp}.log")
-    )
-    download_logger = setup_logger(
-        "download", os.path.join("download-logs", f"{painter}-{timestamp}.log")
-    )
-    cpu_logger = setup_logger(
-        "cpu", os.path.join("cpu-logs", f"{painter}-{timestamp}.log")
-    )
+def append_download_times(excel_file: Path, times: List[Tuple[str, float]]) -> None:
+    """Append a ‘Download Times’ sheet to *excel_file* (overwrites if exists)."""
+    if not times:
+        return
+    df: pd.DataFrame = pd.DataFrame(times, columns=["PDF Name", "Seconds"])
+    df = df.sort_values("Seconds", ascending=False).reset_index(drop=True)
 
-    # Reset download time data for this painter
-    download_time_data = []
+    wb = load_workbook(excel_file)
+    if "Download Times" in wb.sheetnames:
+        wb.remove(wb["Download Times"])
+    ws = wb.create_sheet("Download Times")
+    ws.append(["PDF Name", "Seconds"])
+    for name, sec in df.itertuples(index=False):
+        ws.append([name, sec])
+    for column in ws.columns:
+        width = max(len(str(c.value)) for c in column if c.value) + 2
+        ws.column_dimensions[get_column_letter(column[0].column)].width = width
+    wb.save(excel_file)
 
-    overall_start = time.perf_counter()
-    print(f"Processing painter: {painter}")
-    fetch_logger.info(f"Processing painter: {painter}")
 
-    works = fetch_works(painter)
-    print(f"Fetched {len(works)} works for {painter}")
+# ───────────────────────── painter wrapper ────────────────────────────────────
+
+
+def process_painter(
+    painter: str,
+    max_workers: int,
+    per_page: int,
+    sleep_sec: float,
+) -> None:
+    """One-stop processing for a single painter."""
+    ts: str = time.strftime("%Y%m%d-%H%M%S")
+    dlog = _setup_logger("download", LOG_DIRS[2] / f"{painter}-{ts}.log")
+    clog = _setup_logger("cpu", LOG_DIRS[3] / f"{painter}-{ts}.log")
+
+    # fetch & store
+    start_time: float = time.perf_counter()
+    works = fetch_works(painter, per_page=per_page, sleep_sec=sleep_sec)
     if not works:
-        fetch_logger.info(
-            f"No works fetched for {painter}. Skipping further processing."
-        )
-        print(f"No works fetched for {painter}. Skipping further processing.")
+        print("  no works found – skipped")
         return
 
-    excel_file = create_excel_file(painter, works)
-    print(f"Excel file created: {excel_file}")
+    excel_file: Path = create_excel(painter, works)
+    times = asyncio.run(download_pdfs(excel_file, painter, max_workers, dlog, clog))
+    append_download_times(excel_file, times)
 
-    download_all_pdfs(excel_file, painter, max_workers)
-
-    overall_end = time.perf_counter()
-    runtime = round(overall_end - overall_start, 3)
-    download_logger.info(f"Total program runtime for {painter}: {runtime:.2f} seconds.")
-    print(f"Total runtime for {painter}: {runtime:.2f} seconds.")
+    elapsed: float = time.perf_counter() - start_time
+    print(f"  done in {elapsed:.1f} s  ({len(times)} PDFs)")
 
 
-# --- Main execution ---
-def main():
-    # Create required directories if they don't exist.
-    for dirname in [
-        "ExcelFiles",
-        "PDFs",
-        "excel-logs",
-        "cpu-logs",
-        "download-logs",
-        "fetch-logs",
-    ]:
-        os.makedirs(dirname, exist_ok=True)
+# ─────────────────────────── main entry point ────────────────────────────────
 
-    # Read painters.xlsx to generate the list of painters.
-    # The Excel file should have columns: "Artist" and "Query String"
-    df_painters = pd.read_excel("painters.xlsx")
 
-    # Specify which rows of the Excel file to process.
-    # start_row=1 → first data row (below headers); end_row is inclusive.
-    start_row = 345  # For example, process starting with row 126
-    end_row = 451  # For example, process through row 150.
+def _parse_range(text: str) -> Tuple[int, int | None]:
+    """
+    Convert “N” or “A:B” into (start, end)  – both 1-based, *end* inclusive.
+    Validation is minimal; ValueError propagates to argparse.
+    """
+    if ":" in text:
+        a, b = (int(x) for x in text.split(":", 1))
+        return a, b
+    return 1, int(text)
 
-    # Convert to zero-based indices.
-    start_index = start_row - 1
-    # Since iloc slicing is exclusive at the end, we use end_row as is.
-    df_subset = df_painters.iloc[start_index:end_row]
 
-    # Convert the subset DataFrame to a list of dictionaries.
-    painters = df_subset.to_dict(orient="records")
+def main() -> None:
+    """CLI front-door."""
+    parser = argparse.ArgumentParser(
+        description="Download OpenAlex PDFs for painters "
+        "(page size, sleep time and workers are taken from the constants "
+        "defined at the top of the file)."
+    )
+    parser.add_argument(
+        "-r",
+        "--rows",
+        metavar="N | A:B",
+        help="Rows in painters.xlsx (1-based).  E.g. 100  or  350:420.",
+    )
+    parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        help="Number of concurrent workers (default: auto-detect)",
+    )
+    parser.add_argument(
+        "-p",
+        "--per-page",
+        type=int,
+        default=DEFAULT_PER_PAGE,
+        help="Results per page for OpenAlex API (default: %(default)d)",
+    )
+    parser.add_argument(
+        "-s",
+        "--sleep",
+        type=float,
+        default=DEFAULT_SLEEP_SEC,
+        help="Sleep time between requests (default: %(default).1f s)",
+    )
+    args = parser.parse_args()
 
-    # Configure max_workers (you can adjust this value)
-    max_workers = 5
+    start_row, end_row = (
+        (START_ROW, END_ROW) if not args.rows else _parse_range(args.rows)
+    )
 
-    # Process each painter one after the other.
-    for idx, painter_info in enumerate(painters, start=start_row):
-        query_string = painter_info["Query String"]
-        print(f"Processing row: {idx}")
-        # Call process_painter with the query string and number of workers.
-        process_painter(query_string, max_workers)
+    # ensure directories
+    EXCEL_DIR.mkdir(exist_ok=True)
+    PDF_DIR.mkdir(exist_ok=True)
+    for d in LOG_DIRS:
+        d.mkdir(exist_ok=True)
+
+    df_painters: pd.DataFrame = pd.read_excel(PAINTERS_XLSX)
+    subset: pd.DataFrame = df_painters.iloc[
+        start_row - 1 : end_row
+    ]  # end_row may be None
+
+    max_workers: int = max(MIN_WORKERS, os.cpu_count() * MAX_WORKERS_FACTOR)
+    if args.workers:
+        max_workers = max(1, args.workers)
+
+    for i, row in enumerate(subset.itertuples(index=False), start=start_row):
+        painter: str = row[1] if "Query String" in df_painters.columns else row[0]
+        print(f"Row {i}", end="")
+        process_painter(
+            painter,
+            max_workers=max_workers,
+            per_page=args.per_page,
+            sleep_sec=args.sleep,
+        )
 
 
 if __name__ == "__main__":
-    # main()
-    print("Get logging files in directory first!")
+    main()

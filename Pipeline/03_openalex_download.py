@@ -43,15 +43,24 @@ from urllib3.util.retry import Retry
 # ──────────────────────────── configuration ───────────────────────────────────
 
 CONTACT_EMAIL: str = "xlct43@durham.ac.uk"
-PAINTERS_XLSX: Path = Path("painters.xlsx")
-EXCEL_DIR: Path = Path("ExcelFiles")
-PDF_DIR: Path = Path("PDFs")
 
+# ── Excel folders ------------------------------------------------------------
+EXCEL_DIR: Path = Path("Excel-Files")  # root for every workbook
+WORKS_DIR: Path = EXCEL_DIR / "Painter-Works-Metadata"  # per-painter workbooks
+PAINTERS_XLSX: Path = EXCEL_DIR / "painters.xlsx"  # input list
+
+# ── Output PDFs --------------------------------------------------------------
+# keep them inside the Pipeline package: “…/Pipeline/PDFs/”
+PDF_DIR: Path = Path(__file__).resolve().parent / "PDFs"
+
+# ── Logs ---------------------------------------------------------------------
+LOG_ROOT: Path = Path("logs")
+PAINTER_LOG_DIR: Path = LOG_ROOT / "painter-logs"
 LOG_DIRS: Tuple[Path, ...] = (
-    Path("fetch-logs"),
-    Path("excel-logs"),
-    Path("download-logs"),
-    Path("cpu-logs"),
+    LOG_ROOT / "fetch-logs",
+    LOG_ROOT / "excel-logs",
+    LOG_ROOT / "download-logs",
+    LOG_ROOT / "cpu-logs",
 )
 
 TOPIC_IDS: str = (
@@ -261,7 +270,7 @@ def create_excel(painter: str, works: List[Dict]) -> Path:
         )
     df_download: pd.DataFrame = pd.DataFrame(rows_downloadable)
 
-    dest: Path = EXCEL_DIR / f"{painter.lower()}_works.xlsx"
+    dest: Path = WORKS_DIR / f"{painter.lower()}_works.xlsx"
     with pd.ExcelWriter(dest, engine="openpyxl") as writer:
         df_main.to_excel(writer, index=False, sheet_name="Main")
         df_filtered.to_excel(writer, index=False, sheet_name="Filtered")
@@ -406,8 +415,8 @@ def process_painter(
 ) -> None:
     """One-stop processing for a single painter."""
     ts: str = time.strftime("%Y%m%d-%H%M%S")
-    dlog = _setup_logger("download", LOG_DIRS[2] / f"{painter}-{ts}.log")
-    clog = _setup_logger("cpu", LOG_DIRS[3] / f"{painter}-{ts}.log")
+    dlog = _setup_logger("download", PAINTER_LOG_DIR / f"{painter}-{ts}.log")
+    clog = _setup_logger("cpu", PAINTER_LOG_DIR / f"{painter}-{ts}.log")
 
     # fetch & store
     start_time: float = time.perf_counter()
@@ -479,9 +488,10 @@ def main() -> None:
 
     # ensure directories
     EXCEL_DIR.mkdir(exist_ok=True)
+    WORKS_DIR.mkdir(exist_ok=True)
     PDF_DIR.mkdir(exist_ok=True)
-    for d in LOG_DIRS:
-        d.mkdir(exist_ok=True)
+    for d in (*LOG_DIRS, PAINTER_LOG_DIR):
+        d.mkdir(parents=True, exist_ok=True)
 
     df_painters: pd.DataFrame = pd.read_excel(PAINTERS_XLSX)
     subset: pd.DataFrame = df_painters.iloc[

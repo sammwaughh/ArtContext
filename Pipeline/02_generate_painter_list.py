@@ -27,9 +27,9 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 # ──────────────────────────── constants ───────────────────────────────────────
-
-SOURCE_XLSX: Path = Path("paintings.xlsx")
-DEST_XLSX: Path = Path("painters.xlsx")
+EXCEL_DIR: Path = Path("Excel-Files")  # output directory
+SOURCE_XLSX: Path = EXCEL_DIR / "paintings.xlsx"  # script-1 output
+DEST_XLSX: Path = EXCEL_DIR / "painters.xlsx"  # new file
 
 
 def to_query(s: str) -> str:
@@ -52,6 +52,7 @@ def autosize(ws: Worksheet) -> None:
 
 def main() -> NoReturn:
     """Extract creators from paintings.xlsx and save painters.xlsx."""
+    EXCEL_DIR.mkdir(exist_ok=True)  # ensure directory exists
 
     source_path: Path = SOURCE_XLSX
     if not source_path.is_file():
@@ -66,6 +67,11 @@ def main() -> NoReturn:
     creators = (
         df_paintings["Creator"].dropna().astype(str).str.strip().unique().tolist()
     )
+
+    # ── NEW: discard rows that look like IRIs ---------------------------------
+    creators = [
+        c for c in creators if not c.lower().startswith(("http://", "https://"))
+    ]
 
     # preserve original order of appearance
     artists = pd.Series(creators).drop_duplicates().tolist()

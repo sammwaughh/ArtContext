@@ -42,7 +42,7 @@ from urllib3.util.retry import Retry
 
 # ──────────────────────────── configuration ───────────────────────────────────
 
-CONTACT_EMAIL: str = "xlct43@durham.ac.uk"
+CONTACT_EMAIL: str = "samjmwaugh@gmail.com"
 
 # ── Excel folders ------------------------------------------------------------
 EXCEL_DIR: Path = Path("Excel-Files")  # root for every workbook
@@ -80,6 +80,10 @@ MIN_WORKERS: int = 6
 START_ROW: int = 1  # default CLI range start (1-based)
 END_ROW: int | None = None  # default CLI range end   (inclusive)
 DEFAULT_SLEEP_SEC: float = 0.15  # ≈6-7 rps < OpenAlex 10 rps cap
+
+# ── Filtering ----------------------------------------------------------------
+# Keep only works whose OpenAlex relevance_score exceeds this value
+RELEVANCE_THRESHOLD: float = 1.0
 
 # Only fetch columns we actually use (smaller payloads, faster)
 SELECT_FIELDS: str = (
@@ -215,7 +219,7 @@ def fetch_works(
     pbar.close()
     LOGGER.info("%s finished – pages=%d  works=%d", painter, page, len(works))
     # Early relevance filter
-    return [w for w in works if w.get("relevance_score", 0) > 1]
+    return [w for w in works if w.get("relevance_score", 0) > RELEVANCE_THRESHOLD]
 
 
 # ───────────────────────── Excel creation ─────────────────────────────────────

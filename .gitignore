@@ -6,6 +6,7 @@ Excel-Files/
 .pdf
 /Images
 /Pipeline/logs
+/Pipeline/PDFs/
 
 # Environment
 .venv/

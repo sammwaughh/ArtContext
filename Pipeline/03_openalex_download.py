@@ -68,18 +68,24 @@ TOPIC_IDS: str = (
     "T13133|T12179|T13342|T12632|T14002|T14322"
 )
 
-DEFAULT_PER_PAGE: int = 200  # OpenAlex page size
+DEFAULT_PER_PAGE: int = 200  # OpenAlex page size (API max)
 PDF_CHUNK_SIZE: int = 8_192  # bytes
 CPU_SAMPLE_SEC: int = 1
-MAX_RETRIES: int = 3
-BACKOFF_FACTOR: float = 0.3
-SESSION_TIMEOUT_SEC: int = 20
-MAX_WORKERS_FACTOR: int = 2  # ≈ workers = CPUs × factor
-MIN_WORKERS: int = 4
+MAX_RETRIES: int = 5  # more resilience
+BACKOFF_FACTOR: float = 0.5  # 0.5 → 0.5,1,2,4,8 s back-off
+SESSION_TIMEOUT_SEC: int = 30  # large pages need a bit more
+MAX_WORKERS_FACTOR: int = 3  # ≈ workers = CPUs × factor
+MIN_WORKERS: int = 6
 
 START_ROW: int = 1  # default CLI range start (1-based)
 END_ROW: int | None = None  # default CLI range end   (inclusive)
-DEFAULT_SLEEP_SEC: float = 1.0  # politeness delay between API calls
+DEFAULT_SLEEP_SEC: float = 0.15  # ≈6-7 rps < OpenAlex 10 rps cap
+
+# Only fetch columns we actually use (smaller payloads, faster)
+SELECT_FIELDS: str = (
+    "id,display_name,relevance_score,doi,primary_location,type,"
+    "open_access,locations,best_oa_location"
+)
 
 # ──────────────────────────── helpers & utils ─────────────────────────────────
 
@@ -119,6 +125,24 @@ def _setup_logger() -> logging.Logger:
 
 
 LOGGER: logging.Logger = _setup_logger()
+
+# ─────────────────────────── file-level log helper ───────────────────────────
+
+
+def _file_logger(path: Path) -> logging.Logger:
+    """
+    Return a fresh logger that writes *only* to *path*.
+    The logger name is the stem of the file so each painter gets its own one.
+    """
+    logger = logging.getLogger(path.stem)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False  # don’t double-write via root
+    if logger.hasHandlers():
+        logger.handlers.clear()
+    handler = logging.FileHandler(path)
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(handler)
+    return logger
 
 
 def _safe_json_parse(value: str | Dict | List) -> Dict | List | None:
@@ -164,6 +188,7 @@ def fetch_works(
             "filter": query_filter,
             "search": painter,
             "per_page": per_page,
+            "select": SELECT_FIELDS,
             "cursor": cursor,
             "mailto": CONTACT_EMAIL,
         }
@@ -196,7 +221,7 @@ def fetch_works(
 # ───────────────────────── Excel creation ─────────────────────────────────────
 
 MAIN_COLS: Tuple[str, ...] = (
-    "title",
+    "title",  # we rename display_name → title below
     "relevance_score",
     "id",
     "doi",
@@ -250,10 +275,17 @@ def _best_and_backup(row: pd.Series) -> Tuple[str, str]:
 
 def create_excel(painter: str, works: List[Dict]) -> Path:
     """Write three sheets (Main, Filtered, Downloadable) and return the file path."""
-    df_main: pd.DataFrame = (
-        pd.DataFrame(works) if works else pd.DataFrame(columns=MAIN_COLS)
-    )
-    df_filtered: pd.DataFrame = df_main[MAIN_COLS].copy()
+    # Build DataFrame and normalise column names
+    df_main: pd.DataFrame = pd.DataFrame(works)
+    if "display_name" in df_main.columns and "title" not in df_main.columns:
+        df_main = df_main.rename(columns={"display_name": "title"})
+
+    # Ensure every expected column exists so `.loc[:, MAIN_COLS]` never fails
+    for col in MAIN_COLS:
+        if col not in df_main.columns:
+            df_main[col] = pd.NA
+
+    df_filtered: pd.DataFrame = df_main.loc[:, MAIN_COLS].copy()
 
     rows_downloadable: List[Dict[str, str | float]] = []
     for _, row in df_filtered.iterrows():
@@ -307,7 +339,10 @@ async def _grab_pdf(
     start = time.perf_counter()
 
     async with sem:
-        async with httpx.AsyncClient(timeout=SESSION_TIMEOUT_SEC) as client:
+        async with httpx.AsyncClient(
+            timeout=SESSION_TIMEOUT_SEC,
+            limits=httpx.Limits(max_keepalive_connections=20),
+        ) as client:
             for url in (best, backup):
                 if not url:
                     continue
@@ -415,8 +450,8 @@ def process_painter(
 ) -> None:
     """One-stop processing for a single painter."""
     ts: str = time.strftime("%Y%m%d-%H%M%S")
-    dlog = _setup_logger("download", PAINTER_LOG_DIR / f"{painter}-{ts}.log")
-    clog = _setup_logger("cpu", PAINTER_LOG_DIR / f"{painter}-{ts}.log")
+    dlog = _file_logger(PAINTER_LOG_DIR / f"{painter}-{ts}-download.log")
+    clog = _file_logger(PAINTER_LOG_DIR / f"{painter}-{ts}-cpu.log")
 
     # fetch & store
     start_time: float = time.perf_counter()

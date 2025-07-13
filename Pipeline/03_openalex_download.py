@@ -241,7 +241,49 @@ def fetch_works(
     return [w for w in works if w.get("relevance_score", 0) > RELEVANCE_THRESHOLD]
 
 
-# ───────────────────────── Excel creation ─────────────────────────────────────
+# ───────────────────────── JSON metadata writer ──────────────────────────────
+def _concept_ids(concepts_field) -> List[str]:
+    """Extract bare OpenAlex concept/topic IDs from the `concepts` array."""
+    ids: List[str] = []
+    concepts = _safe_json_parse(concepts_field)
+    if not concepts:
+        return ids
+    for c in concepts:
+        if isinstance(c, dict) and "id" in c:
+            # keep just the final path segment, e.g. “…/C554736915”
+            ids.append(c["id"].rsplit("/", 1)[-1])
+    return ids
+
+
+def write_json_metadata(painter: str, works: List[Dict]) -> Path:
+    """
+    Dump a per-painter JSON file with the essential metadata
+    (id, title, relevance_score, tags, PDF links …).
+    """
+    rows: List[Dict] = []
+    for w in works:
+        best, backup = _best_and_backup(pd.Series(w))
+        rows.append(
+            {
+                "id": w.get("id", ""),
+                "title": w.get("display_name", ""),
+                "relevance_score": w.get("relevance_score", 0.0),
+                "tags": _concept_ids(w.get("concepts")),
+                "doi": w.get("doi"),
+                "type": w.get("type"),
+                "best_pdf": best,
+                "backup_pdf": backup,
+            }
+        )
+
+    JSON_DIR.mkdir(exist_ok=True)
+    dest: Path = JSON_DIR / f"{painter.lower()}.json"
+    dest.write_text(json.dumps(rows, ensure_ascii=False, indent=2))
+    LOGGER.info("%s JSON metadata saved (%d works)", painter, len(rows))
+    return dest
+
+
+# ─────────────────────────── Excel creation ─────────────────────────────────────
 
 MAIN_COLS: Tuple[str, ...] = (
     "title",  # we rename display_name → title below
@@ -484,6 +526,8 @@ def process_painter(
         return
 
     excel_file: Path = create_excel(painter, works)
+    write_json_metadata(painter, works)  # new JSON output
+
     times = asyncio.run(download_pdfs(excel_file, painter, max_workers, dlog, clog))
     append_download_times(excel_file, times)
 
@@ -548,6 +592,7 @@ def main() -> None:
     EXCEL_DIR.mkdir(exist_ok=True)
     WORKS_DIR.mkdir(exist_ok=True)
     PDF_DIR.mkdir(exist_ok=True)
+    JSON_DIR.mkdir(exist_ok=True)
     for d in (*LOG_DIRS, PAINTER_LOG_DIR):
         d.mkdir(parents=True, exist_ok=True)
 

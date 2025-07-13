@@ -8,16 +8,14 @@ paintings.xlsx – sheet “Paintings”, column “Creator”
 
 Output (for script 3)
 ---------------------
-painters.xlsx – sheet “Painters” with two columns
-• Artist        – original creator name
-• Query String  – lower-case ASCII, stripped of brackets / accents
+painters.xlsx – sheet “Painters” with a single column
+• Artist  – original creator name (capitalisation preserved)
 
 The sheet is auto-sized so script 3 can read it unchanged.
 """
 
 from __future__ import annotations
 
-import unicodedata
 from pathlib import Path
 from typing import NoReturn
 
@@ -30,16 +28,6 @@ from openpyxl.worksheet.worksheet import Worksheet
 EXCEL_DIR: Path = Path("Excel-Files")  # output directory
 SOURCE_XLSX: Path = EXCEL_DIR / "paintings.xlsx"  # script-1 output
 DEST_XLSX: Path = EXCEL_DIR / "painters.xlsx"  # new file
-
-
-def to_query(s: str) -> str:
-    """
-    Return a search-friendly version of *s*:
-    lower-case, accents removed, text inside “()” dropped.
-    """
-    s = s.split("(")[0].strip()  # drop bracketed nick-names etc.
-    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
-    return " ".join(s.lower().split())
 
 
 def autosize(ws: Worksheet) -> None:
@@ -76,7 +64,7 @@ def main() -> NoReturn:
     # preserve original order of appearance
     artists = pd.Series(creators).drop_duplicates().tolist()
 
-    data = [{"Artist": a, "Query String": to_query(a)} for a in artists]
+    data = [{"Artist": a} for a in artists]  # single column
     df_out = pd.DataFrame(data)
 
     with pd.ExcelWriter(DEST_XLSX, engine="openpyxl") as writer:

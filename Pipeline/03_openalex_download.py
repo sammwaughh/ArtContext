@@ -48,6 +48,8 @@ CONTACT_EMAIL: str = "samjmwaugh@gmail.com"
 EXCEL_DIR: Path = Path("Excel-Files")  # root for every workbook
 WORKS_DIR: Path = EXCEL_DIR / "Painter-Works-Metadata"  # per-painter workbooks
 PAINTERS_XLSX: Path = EXCEL_DIR / "painters.xlsx"  # input list
+# ── JSON metadata -----------------------------------------------------------
+JSON_DIR: Path = Path("JSON-Metadata")  # new – per-painter JSON
 
 # ── Output PDFs --------------------------------------------------------------
 # keep them inside the Pipeline package: “…/Pipeline/PDFs/”
@@ -63,9 +65,20 @@ LOG_DIRS: Tuple[Path, ...] = (
     LOG_ROOT / "cpu-logs",
 )
 
+# Topics centred on the historical, cultural and iconographic interpretation
+# of painting (ancient → contemporary, incl. Asian & Islamic art, iconography
+# and art criticism).  Conservation, architecture and museum-studies topics
+# are deliberately omitted.
 TOPIC_IDS: str = (
-    "T14092|T14191|T12372|T14469|T12680|T14366|T13922|T12444|"
-    "T13133|T12179|T13342|T12632|T14002|T14322"
+    "C554736915|"  # Classical Antiquity Studies
+    "T10595|"  # Medieval Literature and History
+    "T12076|"  # Renaissance and Early Modern Studies
+    "C189135316|"  # Modern Art
+    "C85363599|"  # Contemporary Art
+    "C12183850|"  # Indian / Asian Art
+    "C2993994385|"  # Islamic Art
+    "C501303744|"  # Iconography
+    "C204034006"  # Art Criticism
 )
 
 DEFAULT_PER_PAGE: int = 200  # OpenAlex page size (API max)
@@ -86,9 +99,14 @@ DEFAULT_SLEEP_SEC: float = 0.15  # ≈6-7 rps < OpenAlex 10 rps cap
 RELEVANCE_THRESHOLD: float = 1.0
 
 # Only fetch columns we actually use (smaller payloads, faster)
+# SELECT_FIELDS: str = (
+#     "id,display_name,relevance_score,doi,primary_location,type,"
+#     "open_access,locations,best_oa_location"
+# )
+# need the concepts list to attach topic IDs
 SELECT_FIELDS: str = (
     "id,display_name,relevance_score,doi,primary_location,type,"
-    "open_access,locations,best_oa_location"
+    "open_access,locations,best_oa_location,concepts"
 )
 
 # ──────────────────────────── helpers & utils ─────────────────────────────────
@@ -190,6 +208,7 @@ def fetch_works(
         pbar.update(1)
         params: Dict[str, str | int | float] = {
             "filter": query_filter,
+            # wrap the name in quotes so OpenAlex treats it as an exact phrase
             "search": painter,
             "per_page": per_page,
             "select": SELECT_FIELDS,
@@ -543,6 +562,8 @@ def main() -> None:
 
     for i, row in enumerate(subset.itertuples(index=False), start=start_row):
         painter: str = row[1] if "Query String" in df_painters.columns else row[0]
+        # painters.xlsx now contains a single column (“Artist”)
+        painter: str = row[0]
         print(f"Row {i}", end="")
         process_painter(
             painter,

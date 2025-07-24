@@ -1,0 +1,17 @@
+2025-07-11 18:53:09,333 [INFO] Query start – painter=leonardo da vinci
+2025-07-11 18:53:11,037 [INFO] leonardo da vinci page 1 – 200 works
+2025-07-11 18:53:12,101 [INFO] leonardo da vinci page 2 – 200 works
+2025-07-11 18:53:13,203 [INFO] leonardo da vinci page 3 – 200 works
+2025-07-11 18:53:15,069 [INFO] leonardo da vinci page 4 – 200 works
+2025-07-11 18:53:15,957 [INFO] leonardo da vinci page 5 – 169 works
+2025-07-11 18:53:16,487 [INFO] leonardo da vinci page 6 – 0 works
+2025-07-11 18:53:16,643 [INFO] leonardo da vinci finished – pages=6  works=969
+2025-07-11 18:54:42,557 [INFO] Query start – painter=leonardo da vinci
+2025-07-11 18:54:43,917 [INFO] leonardo da vinci page 1 – 200 works
+2025-07-11 18:54:45,148 [INFO] leonardo da vinci page 2 – 200 works
+2025-07-11 18:54:46,487 [INFO] leonardo da vinci page 3 – 200 works
+2025-07-11 18:54:47,700 [INFO] leonardo da vinci page 4 – 200 works
+2025-07-11 18:54:48,726 [INFO] leonardo da vinci page 5 – 169 works
+2025-07-11 18:54:49,225 [INFO] leonardo da vinci page 6 – 0 works
+2025-07-11 18:54:49,379 [INFO] leonardo da vinci finished – pages=6  works=969
+2025-07-11 18:54:49,980 [INFO] leonardo da vinci workbook saved (762 rows)

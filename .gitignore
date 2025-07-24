@@ -7,6 +7,13 @@ Excel-Files/
 /Images
 /Pipeline/logs
 /Pipeline/PDFs/
+/Pipeline/Marker_Output/
+/Pipeline/PDF_Bucket/
+/Pipeline/CLIP_Embeddings/
+/Pipeline/PaintingCLIP_Embeddings/
+Artist-JSONs/
+
+__pycache__/
 
 # Environment
 .venv/

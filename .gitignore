@@ -4,13 +4,14 @@
 # Files
 Excel-Files/
 .pdf
+.pt
 /Images
-/Pipeline/logs
-/Pipeline/PDFs/
-/Pipeline/Marker_Output/
-/Pipeline/PDF_Bucket/
-/Pipeline/CLIP_Embeddings/
-/Pipeline/PaintingCLIP_Embeddings/
+logs
+PDFs/
+Marker_Output/
+PDF_Bucket/
+CLIP_Embeddings/
+PaintingCLIP_Embeddings/
 Artist-JSONs/
 
 __pycache__/

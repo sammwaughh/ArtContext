@@ -3,14 +3,17 @@ repos:
     rev: 25.1.0         # ← latest released tag
     hooks:
       - id: black
+        exclude: ^Scripts from Project/
 
   - repo: https://github.com/pycqa/isort
     rev: 6.0.1
     hooks:
       - id: isort
+        exclude: ^Scripts from Project/
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.4.7          # pin a version
     hooks:
       - id: ruff
         args: [--fix]     # ← enables auto-applied fixes
+        exclude: ^Scripts from Project/

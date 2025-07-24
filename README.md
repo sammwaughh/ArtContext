@@ -1,159 +1,136 @@
-# ArtContext — PaintingCLIP Pipeline  
-*End-to-end generation of a fine-tuned CLIP model for art-historical images*
+# ArtContext
 
----
+A computational pipeline for harvesting, processing, and analyzing academic literature about visual art using OpenAlex, Wikidata, and multimodal embeddings.
 
-## 1 What this repository does
+## Overview
 
-ArtContext starts with nothing but public data (Wikidata + OpenAlex) and
-finishes with **PaintingCLIP** – a CLIP ViT-B/32 model adapted to
-paintings via LoRA fine-tuning.  
-The **`Pipeline/`** directory now contains every script that is actually
-executed:
+ArtContext automates the collection and analysis of scholarly articles about painters and their works. The pipeline:
+1. Harvests painter metadata from Wikidata
+2. Queries OpenAlex for academic papers about each painter
+3. Downloads available PDFs
+4. Converts PDFs to Markdown for text processing
+5. Extracts sentences and generates multimodal embeddings using CLIP
 
-| # | Script | Purpose (one-line) |
-|---|--------|--------------------|
-| 01 | `01_wikidata_harvest.py` | Harvest master list of paintings from Wikidata → `paintings.xlsx`. |
-| 02 | `02_painter_list.py` | Write 200-row `painters.xlsx` (artist ↔ query string). |
-| 03 | `03_openalex_download.py` | Query OpenAlex, save PDFs + `<painter>_works.xlsx`. |
-| 04 | `04_prepare_for_md.py` | Add *For Markdown* sheet that points to each downloaded PDF. |
-| 05 | `05_pdf_to_markdown.py` | Convert selected PDFs (<10 MB) to Markdown with Marker. |
-| 06 | `06_cache_sbert.py` | Embed 3-sentence contexts with SBERT → `cache/`. |
-| 07 | `07_top3_sentences.py` | Pick top-3 descriptive sentences per painting; write to `paintings.xlsx`. |
-| 08 | `08_build_clip_dataset.py` | Build `CLIP_dataset_labels.csv` (image + caption pairs). |
-| 09 | `09_finetune_clip_lora.py` | Train LoRA adapters → **PaintingCLIP** in `clip_finetuned_lora_best/`. |
-| 10 | `10_cache_painting_clip.py` | Re-encode contexts with PaintingCLIP text encoder. |
-| 11 | `11_eval_top10.py` | Retrieve top-10 zero-shot sentences (vanilla vs PaintingCLIP). |
+## Pipeline Workflow
 
-Intermediate folders are created on-the-fly:
+The pipeline consists of batch scripts that should be run in the following order:
 
-```
-Dataset/Images/            # painting PNGs (store yourself)
-PDFs/                      # raw OA PDFs
-ExcelFiles/                # per-painter metadata
-Small_Markdown/            # Marker output
-cache/                     # SBERT embeddings
-cache_clip_embeddings/     # vanilla CLIP text embeddings
-cache_clip_finetuned_embeddings/   # PaintingCLIP embeddings
-clip_finetuned_lora_best/  # final LoRA adapters
-Results/                   # evaluation artefacts
-```
-
----
-
-## 2 One-time setup
-
-### 2.1 Install system packages
-
-| Requirement | Why | macOS | Ubuntu |
-|-------------|-----|-------|--------|
-| **Python 3.11** | interpreter tested with the pipeline | `brew install python@3.11` or `pyenv install 3.11.9` | `sudo apt install python3.11` |
-| **Marker**  | PDF → Markdown | `pip install marker` | same |
-| **Graphviz** (optional) | pretty diagrams in notebooks | `brew install graphviz` | `sudo apt install graphviz` |
-| **Xcode CLT** (macOS) | build C-extensions if wheels are missing | `xcode-select --install` | – |
-
-### 2.2 Create Python environment
-
+### 1. Wikidata Harvest
 ```bash
-git clone https://github.com/<you>/ArtContext.git
-cd ArtContext
-
-# venv example (Conda works equally well)
-python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-
-pip install --upgrade pip wheel
-pip install -r requirements.txt
-
-The pinned versions in *requirements.txt* (`marker==2.1.5`,
-`requests==2.25.1`) avoid the dependency conflict we discovered while
-setting up the environment.  If you bump either package later, make sure
-they remain compatible.
-
-*GPU:*  
-– Apple Silicon users get Metal/MPS automatically.  
-– CUDA users must install the matching NVIDIA toolkit **before**
-`pip install torch`.
-
-### 2.3 Download NLTK data
-
-```bash
-python - <<'PY'
-import nltk, ssl
-ssl._create_default_https_context = ssl._create_unverified_context
-nltk.download("punkt", quiet=True, raise_on_error=True)
-PY
+python batch_harvest_wikidata.py
 ```
+- Queries Wikidata for painter information
+- Populates `artists.json` with painter metadata
+- Creates initial painter entries in `paintings.xlsx`
 
----
-
-## 3 Running the full pipeline
-
-> The whole process (esp. OpenAlex downloads) can take many hours and
-> several gigabytes of storage.  Every stage is restart-safe; you can
-> stop and continue later.
-
+### 2. Query OpenAlex
 ```bash
-cd Pipeline
-
-# 1 Metadata
-python 01_wikidata_harvest.py        # creates paintings.xlsx  (~2 min)
-python 02_painter_list.py            # creates painters.xlsx   (<1 s)
-
-# 2 OpenAlex crawl   (edit constants at top of 03_* to limit rows)
-python 03_openalex_download.py       # large download  (hours)
-
-# 3 Organise PDFs & convert to Markdown
-python 04_prepare_for_md.py
-python 05_pdf_to_markdown.py         # needs 'marker_single' CLI
-
-# 4 Sentence caches
-python 06_cache_sbert.py             # SBERT   (30-60 min)
-
-# 5 Pick sentences & build CLIP dataset
-python 07_top3_sentences.py
-python 08_build_clip_dataset.py
-
-# 6 Fine-tune CLIP (≈3 h on M1 Pro, faster on high-end GPU)
-python 09_finetune_clip_lora.py
-
-# 7 PaintingCLIP cache & evaluation
-python 10_cache_painting_clip.py
-python 11_eval_top10.py
+python batch_query_open_alex.py
 ```
+- Reads painter names from `painters.xlsx`
+- Queries OpenAlex API for academic works mentioning each painter
+- Saves results to `Artist-JSONs/<painter_name>.json`
+- Uses helper: `query_open_alex_with.py`
 
-After stage 11 you will have:
+### 3. Download Works
+```bash
+python batch_download_works.py
+```
+- Processes all artist JSON files in `Artist-JSONs/`
+- Downloads available PDFs to `PDF_Bucket/`
+- Updates `works.json` with download metadata
+- Uses helpers: `download_works_on.py`, `download_single_work.py`
 
-* `clip_finetuned_lora_best/` – PaintingCLIP adapters  
-* `vanilla_clip.xlsx` & `painting_clip.xlsx` – zero-shot top-10 sentences  
-  ready for manual “relevant / irrelevant” labelling.
+### 4. PDF to Markdown
+```bash
+python batch_pdf_to_markdown.py
+```
+- Converts downloaded PDFs to Markdown format
+- Outputs to `Marker_Output/<work_id>/`
+- Uses helper: `single_pdf_to_markdown.py`
 
-To visualise macro Precision-Recall curves copy
-`Results/precision_recall_curves.py` into `Pipeline/` and run it once
-the `Label` columns are filled.
+### 5. Extract Sentences
+```bash
+python batch_markdown_file_to_english_sentences.py
+```
+- Extracts English sentences from Markdown files
+- Updates `sentences.json` with extracted sentences
+- Updates `works.json` with sentence counts
+- Uses helper: `markdown_file_to_english_sentences.py`
 
----
+### 6. Generate Embeddings
+```bash
+python batch_embed_sentences.py
+```
+- Generates CLIP embeddings for all sentences
+- Generates PaintingCLIP embeddings (fine-tuned model)
+- Saves embeddings to `CLIP_Embeddings/` and `PaintingCLIP_Embeddings/`
+- Uses helper: `embed_sentence_with_clip.py`
 
-## 4 Troubleshooting
+## Additional Scripts
 
-| Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| `ResolutionImpossible` about _marker_ / _requests_ | mixing newer `requests` with `marker 2.1.x` | keep `requests==2.25.1` **or** install `marker` with `--no-deps` |
-| `HTTP 429` from OpenAlex | Rate-limit | 03 script already sleeps and retries; just wait. |
-| `marker_single: command not found` | Marker not in PATH | `pip install marker` then reopen terminal. |
-| `torch.mps not available` | Old macOS / PyTorch | Upgrade to PyTorch ≥ 2.2 and macOS ≥ 12.3. |
-| Excel columns show “####” | cell too narrow | double-click the column edge or use OpenPyXL to auto-size again. |
+### Topic Analysis
+```bash
+python build_topics_json.py
+```
+- Creates reverse index of OpenAlex topics to works
+- Generates `topics.json` from `works.json` data
 
----
+### Painter List Generation
+```bash
+python generate_painter_list.py
+```
+- Generates/updates the painter list for processing
 
-## 5 Contributing guidelines
+## Directory Structure
 
-1. Use **absolute paths via `Path(__file__).resolve().parent`** to keep
-   the scripts relocatable.  
-2. Prefer `logging` over `print`; respect the existing log-file layout.  
-3. In comments / docs always say **PaintingCLIP** (legacy name
-   *MintCLIP* is being phased out).  
-4. Pull-requests should update `requirements.txt` and this README when
-   new dependencies or steps are added.
+### Data Directories
+- `Artist-JSONs/` - OpenAlex query results per artist
+- `PDF_Bucket/` - Downloaded PDF files organized by artist
+- `Marker_Output/` - Converted Markdown files from PDFs
+- `CLIP_Embeddings/` - Standard CLIP text embeddings
+- `PaintingCLIP_Embeddings/` - Fine-tuned CLIP embeddings
+- `Excel-Files/` - Excel outputs and working files
+- `logs/` - Execution logs for debugging
 
-Happy hacking 🖼️🤖!
+### Configuration & Models
+- `PaintingCLIP/` - Fine-tuned CLIP adapter (LoRA weights)
+- `Helper Scripts/` - Utility scripts for data cleaning and analysis
+- `Archive/` - Previous versions and documentation
+- `Scripts from Project/` - Legacy scripts (excluded from quality checks)
+
+### Data Files
+- `artists.json` - Artist metadata and associated work IDs
+- `works.json` - Work metadata including URLs, sentences, topics
+- `sentences.json` - Extracted sentences with embedding status
+- `topics.json` - Topic to work ID mapping
+- `painters.xlsx` - Master list of painters to process
+- `paintings.xlsx` - Painting metadata
+
+## Requirements
+
+See `requirements.txt` for Python dependencies. Key requirements:
+- Python 3.8+
+- OpenAlex API access (free, requires email)
+- Wikidata SPARQL access
+- GPU recommended for embedding generation
+
+## Configuration
+
+1. Set your email in scripts that query OpenAlex (required by their API)
+2. Adjust batch sizes and concurrency settings based on your system
+3. Configure logging levels in individual scripts
+
+## Usage Notes
+
+- The pipeline is designed to be resumable - it checks for existing data before reprocessing
+- Most scripts support filtering by artist name or work ID for selective processing
+- Embedding generation is computationally intensive - consider running on GPU
+- OpenAlex API has rate limits - the scripts include automatic retry logic
+
+## Output Format
+
+The pipeline produces structured JSON files that can be used for downstream analysis:
+- Sentence-level embeddings for semantic search
+- Work metadata for bibliometric analysis
+- Topic associations for thematic studies
